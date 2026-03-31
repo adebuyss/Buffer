@@ -185,10 +185,13 @@ class Buffer:
         self._feed_button_pressed = False
         self._retract_button_pressed = False
         self._full_zone_feed_time = 0.
+        self._last_full_feed_time = 0.
         self._in_full_zone = False
         self._extruder_retracting = False
         self._burst_delay_start = 0.
         self._burst_until = 0.
+        self._burst_count = 0
+        self._max_burst_cycles = 5
 
         # Timer handle
         self._control_timer = None
@@ -404,6 +407,13 @@ class Buffer:
                 new_direction = FORWARD
                 self._burst_delay_start = 0.
                 self._burst_until = 0.
+                self._burst_count = 0
+            elif self._burst_count >= self._max_burst_cycles:
+                # Too many bursts without leaving empty zone
+                self._handle_error(
+                    "Buffer stuck in empty zone after %d burst cycles"
+                    % self._burst_count)
+                return
             elif self._burst_until > 0. and eventtime < self._burst_until:
                 # Active burst in progress
                 new_direction = FORWARD
@@ -412,6 +422,7 @@ class Buffer:
                 if eventtime - self._burst_delay_start >= self.burst_delay:
                     self._burst_until = eventtime + self.burst_feed_time
                     self._burst_delay_start = 0.
+                    self._burst_count += 1
                     new_direction = FORWARD
                 else:
                     new_direction = STOP
@@ -424,9 +435,11 @@ class Buffer:
             # only retract after full_zone_timeout of active feeding
             self._burst_delay_start = 0.
             self._burst_until = 0.
+            self._burst_count = 0
             if not self._in_full_zone:
                 self._in_full_zone = True
                 self._full_zone_feed_time = 0.
+                self._last_full_feed_time = 0.
             if self._full_zone_feed_time >= self.full_zone_timeout:
                 # Timeout exceeded - actively retract
                 new_direction = BACK
@@ -436,10 +449,14 @@ class Buffer:
                 new_direction = FORWARD
                 vactual_override = self._velocity_to_vactual(
                     self.extruder_velocity * self.slowdown_factor)
-                # Only accumulate feeding time
-                self._full_zone_feed_time += self.control_interval
+                # Accumulate actual feeding time (not fixed increment)
+                if self._last_full_feed_time > 0.:
+                    self._full_zone_feed_time += \
+                        eventtime - self._last_full_feed_time
+                self._last_full_feed_time = eventtime
             else:
                 # Not extruding and in full zone - just stop
+                self._last_full_feed_time = 0.
                 new_direction = STOP
         elif middle:
             # In the ideal zone - match extruder velocity
@@ -447,6 +464,7 @@ class Buffer:
             self._full_zone_feed_time = 0.
             self._burst_delay_start = 0.
             self._burst_until = 0.
+            self._burst_count = 0
             if self.extruder_velocity > self.min_velocity:
                 new_direction = FORWARD
                 vactual_override = self._velocity_to_vactual(
@@ -464,6 +482,7 @@ class Buffer:
             else:
                 self._burst_delay_start = 0.
                 self._burst_until = 0.
+                self._burst_count = 0
                 if self.motor_direction == FORWARD and \
                         self.extruder_velocity > self.min_velocity:
                     new_direction = FORWARD
@@ -607,8 +626,10 @@ class Buffer:
         self.forward_elapsed = 0.
         self._in_full_zone = False
         self._full_zone_feed_time = 0.
+        self._last_full_feed_time = 0.
         self._burst_delay_start = 0.
         self._burst_until = 0.
+        self._burst_count = 0
         self._extruder_retracting = False
         # Reset extruder tracking
         try:
@@ -625,8 +646,10 @@ class Buffer:
         self.state = STATE_DISABLED
         self._in_full_zone = False
         self._full_zone_feed_time = 0.
+        self._last_full_feed_time = 0.
         self._burst_delay_start = 0.
         self._burst_until = 0.
+        self._burst_count = 0
         gcmd.respond_info("Buffer: automatic control disabled")
 
     def cmd_BUFFER_FEED(self, gcmd):
@@ -666,8 +689,10 @@ class Buffer:
             self.forward_elapsed = 0.
             self._in_full_zone = False
             self._full_zone_feed_time = 0.
+            self._last_full_feed_time = 0.
             self._burst_delay_start = 0.
             self._burst_until = 0.
+            self._burst_count = 0
             gcmd.respond_info("Buffer: error cleared")
         else:
             gcmd.respond_info("Buffer: no error to clear")
