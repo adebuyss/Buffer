@@ -40,6 +40,7 @@ class BufferMotor:
         self.manual_stepper = None
         self.current_direction = STOP
         self._enabled = False
+        self._cached_gconf = None
 
     def handle_ready(self):
         stepper_key = 'manual_stepper %s' % self.stepper_name
@@ -47,6 +48,8 @@ class BufferMotor:
         self.manual_stepper = self.printer.lookup_object(stepper_key)
         tmc_obj = self.printer.lookup_object(tmc_key)
         self.mcu_tmc = tmc_obj.mcu_tmc
+        # Cache GCONF to avoid read-modify-write on every direction change
+        self._cached_gconf = self.mcu_tmc.get_register('GCONF')
         # Read microsteps from the TMC config
         chopconf = self.mcu_tmc.get_register('CHOPCONF')
         mres = (chopconf >> 24) & 0x0F
@@ -109,10 +112,11 @@ class BufferMotor:
         if self.mcu_tmc is None:
             return
         try:
-            gconf = self.mcu_tmc.get_register('GCONF')
             mask = 1 << GCONF_SHAFT_BIT
-            gconf = (gconf & ~mask) | (shaft_val << GCONF_SHAFT_BIT)
+            gconf = ((self._cached_gconf or 0) & ~mask) \
+                | (shaft_val << GCONF_SHAFT_BIT)
             self.mcu_tmc.set_register('GCONF', gconf)
+            self._cached_gconf = gconf
         except Exception:
             logging.warning("buffer: GCONF shaft write failed")
 
@@ -142,6 +146,12 @@ class Buffer:
             'slowdown_factor', 0.5, above=0., below=1.)
         self.full_zone_timeout = config.getfloat(
             'full_zone_timeout', 3.0, above=0.)
+        self.min_velocity = config.getfloat(
+            'min_extrusion_velocity', 0.05, minval=0.)
+        self.burst_feed_time = config.getfloat(
+            'burst_feed_time', 0.5, above=0.)
+        self.burst_delay = config.getfloat(
+            'burst_delay', 0.5, minval=0.)
         self.pause_on_runout = config.getboolean('pause_on_runout', True)
         self.control_interval = config.getfloat(
             'control_interval', 0.1, above=0.)
@@ -174,8 +184,11 @@ class Buffer:
         self._last_ext_time = 0.
         self._feed_button_pressed = False
         self._retract_button_pressed = False
-        self._full_zone_start = 0.
+        self._full_zone_feed_time = 0.
         self._in_full_zone = False
+        self._extruder_retracting = False
+        self._burst_delay_start = 0.
+        self._burst_until = 0.
 
         # Timer handle
         self._control_timer = None
@@ -270,6 +283,7 @@ class Buffer:
         def callback(eventtime, state):
             self.sensor_states[sensor_name] = bool(state)
             if self.auto_enabled:
+                self._update_extruder_velocity(eventtime)
                 self._evaluate_and_drive(eventtime)
         return callback
 
@@ -344,16 +358,21 @@ class Buffer:
         dt = eventtime - self._last_ext_time
         if dt > 0.001:
             delta = cur_pos - self._last_extruder_pos
-            # Only count positive (extrusion), not retraction
             if delta > 0.:
                 self.extruder_velocity = delta / dt  # mm/s
+                self._extruder_retracting = False
+            elif delta < -0.01:
+                # Retraction detected - immediately stop buffer motor
+                self.extruder_velocity = 0.
+                if not self._extruder_retracting:
+                    self._extruder_retracting = True
+                    if self.motor_direction == FORWARD:
+                        self._stop_motor()
+                        self.state = STATE_STOPPED
             else:
                 self.extruder_velocity = 0.
             self._last_extruder_pos = cur_pos
             self._last_ext_time = eventtime
-        # Convert mm/s to RPM for the buffer motor
-        # This requires knowing the buffer motor's mm per revolution
-        # rotation_distance from manual_stepper config handles this
 
     def _evaluate_and_drive(self, eventtime):
         if not self.auto_enabled or not self.material_present:
@@ -377,33 +396,58 @@ class Buffer:
         new_direction = STOP
 
         if empty:
-            # Buffer near empty - full speed forward (safety override)
-            new_direction = FORWARD
-            vactual_override = None  # Use configured speed_rpm
+            # Buffer near empty
             self._in_full_zone = False
+            self._full_zone_feed_time = 0.
+            if self.extruder_velocity > self.min_velocity:
+                # Extruder active - catch up at full speed
+                new_direction = FORWARD
+                self._burst_delay_start = 0.
+                self._burst_until = 0.
+            elif self._burst_until > 0. and eventtime < self._burst_until:
+                # Active burst in progress
+                new_direction = FORWARD
+            elif self._burst_delay_start > 0.:
+                # Waiting for burst delay
+                if eventtime - self._burst_delay_start >= self.burst_delay:
+                    self._burst_until = eventtime + self.burst_feed_time
+                    self._burst_delay_start = 0.
+                    new_direction = FORWARD
+                else:
+                    new_direction = STOP
+            else:
+                # First time empty while stopped - start delay
+                self._burst_delay_start = eventtime
+                new_direction = STOP
         elif full:
             # Buffer near full - slow down proportionally first,
-            # only retract after full_zone_timeout
+            # only retract after full_zone_timeout of active feeding
+            self._burst_delay_start = 0.
+            self._burst_until = 0.
             if not self._in_full_zone:
                 self._in_full_zone = True
-                self._full_zone_start = eventtime
-            full_elapsed = eventtime - self._full_zone_start
-            if full_elapsed >= self.full_zone_timeout:
+                self._full_zone_feed_time = 0.
+            if self._full_zone_feed_time >= self.full_zone_timeout:
                 # Timeout exceeded - actively retract
                 new_direction = BACK
                 vactual_override = None  # Use configured speed_rpm
-            elif self.extruder_velocity > 0.5:
+            elif self.extruder_velocity > self.min_velocity:
                 # Still extruding - slow down feed proportionally
                 new_direction = FORWARD
                 vactual_override = self._velocity_to_vactual(
                     self.extruder_velocity * self.slowdown_factor)
+                # Only accumulate feeding time
+                self._full_zone_feed_time += self.control_interval
             else:
                 # Not extruding and in full zone - just stop
                 new_direction = STOP
         elif middle:
             # In the ideal zone - match extruder velocity
             self._in_full_zone = False
-            if self.extruder_velocity > 0.5:
+            self._full_zone_feed_time = 0.
+            self._burst_delay_start = 0.
+            self._burst_until = 0.
+            if self.extruder_velocity > self.min_velocity:
                 new_direction = FORWARD
                 vactual_override = self._velocity_to_vactual(
                     self.extruder_velocity)
@@ -412,22 +456,29 @@ class Buffer:
         else:
             # No sensors triggered - we're between sensors
             self._in_full_zone = False
-            # Use extruder velocity with correction if we were feeding
-            if self.motor_direction == FORWARD and \
-                    self.extruder_velocity > 0.5:
+            self._full_zone_feed_time = 0.
+            # Cancel burst if we've left the empty zone
+            # (unless burst is active - let it finish)
+            if self._burst_until > 0. and eventtime < self._burst_until:
                 new_direction = FORWARD
-                vactual_override = self._velocity_to_vactual(
-                    self.extruder_velocity * self.correction_factor)
-            elif self.motor_direction == BACK:
-                # Continue retracting until we hit middle
-                new_direction = BACK
-            elif self.extruder_velocity > 0.5:
-                # Default: match extruder velocity
-                new_direction = FORWARD
-                vactual_override = self._velocity_to_vactual(
-                    self.extruder_velocity)
             else:
-                new_direction = STOP
+                self._burst_delay_start = 0.
+                self._burst_until = 0.
+                if self.motor_direction == FORWARD and \
+                        self.extruder_velocity > self.min_velocity:
+                    new_direction = FORWARD
+                    vactual_override = self._velocity_to_vactual(
+                        self.extruder_velocity * self.correction_factor)
+                elif self.motor_direction == BACK:
+                    # Continue retracting until we hit middle
+                    new_direction = BACK
+                elif self.extruder_velocity > self.min_velocity:
+                    # Default: match extruder velocity
+                    new_direction = FORWARD
+                    vactual_override = self._velocity_to_vactual(
+                        self.extruder_velocity)
+                else:
+                    new_direction = STOP
 
         # Apply motor command
         if new_direction != self.motor_direction:
@@ -513,11 +564,11 @@ class Buffer:
             'forward_timeout': self.forward_timeout,
             'speed_rpm': self.motor.speed_rpm,
             'in_full_zone': self._in_full_zone,
-            'full_zone_elapsed': round(
-                (self.reactor.monotonic() - self._full_zone_start
-                 if self._in_full_zone else 0.), 1),
+            'full_zone_feed_time': round(self._full_zone_feed_time, 1),
             'full_zone_timeout': self.full_zone_timeout,
             'slowdown_factor': self.slowdown_factor,
+            'burst_active': self._burst_until > 0.
+                and self.reactor.monotonic() < self._burst_until,
         }
 
     # --- Gcode commands ---
@@ -533,7 +584,8 @@ class Buffer:
                "  Extruder velocity: %.1f mm/s\n"
                "  Speed RPM: %.0f\n"
                "  Forward elapsed: %.1f / %.0f s\n"
-               "  Full zone: %s (%.1f / %.0f s)"
+               "  Full zone: %s (feed %.1f / %.0f s)\n"
+               "  Burst active: %s"
                % (status['state'], status['motor_direction'],
                   status['sensor_empty'], status['sensor_middle'],
                   status['sensor_full'], status['material_present'],
@@ -541,8 +593,9 @@ class Buffer:
                   status['speed_rpm'],
                   status['forward_elapsed'], status['forward_timeout'],
                   status['in_full_zone'],
-                  status['full_zone_elapsed'],
-                  status['full_zone_timeout']))
+                  status['full_zone_feed_time'],
+                  status['full_zone_timeout'],
+                  status['burst_active']))
         if status['error']:
             msg += "\n  ERROR: %s" % status['error']
         gcmd.respond_info(msg)
@@ -553,6 +606,10 @@ class Buffer:
         self.error_msg = ''
         self.forward_elapsed = 0.
         self._in_full_zone = False
+        self._full_zone_feed_time = 0.
+        self._burst_delay_start = 0.
+        self._burst_until = 0.
+        self._extruder_retracting = False
         # Reset extruder tracking
         try:
             extruder = self.printer.lookup_object('extruder')
@@ -567,6 +624,9 @@ class Buffer:
         self._stop_motor()
         self.state = STATE_DISABLED
         self._in_full_zone = False
+        self._full_zone_feed_time = 0.
+        self._burst_delay_start = 0.
+        self._burst_until = 0.
         gcmd.respond_info("Buffer: automatic control disabled")
 
     def cmd_BUFFER_FEED(self, gcmd):
@@ -605,6 +665,9 @@ class Buffer:
             self.error_msg = ''
             self.forward_elapsed = 0.
             self._in_full_zone = False
+            self._full_zone_feed_time = 0.
+            self._burst_delay_start = 0.
+            self._burst_until = 0.
             gcmd.respond_info("Buffer: error cleared")
         else:
             gcmd.respond_info("Buffer: no error to clear")
