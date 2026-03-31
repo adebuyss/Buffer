@@ -1,7 +1,7 @@
 # Klipper extras module for Mellow LLL Plus filament buffer
 #
 # Provides real-time buffer control via hall sensor callbacks and
-# TMC2209 VACTUAL velocity mode, independent of the gcode queue.
+# TMC2208 VACTUAL velocity mode, independent of the gcode queue.
 # Optionally matches extruder velocity for smooth feed-forward control.
 #
 # Copyright (C) 2026  adebuyss
@@ -22,14 +22,14 @@ STATE_ERROR = 'error'
 STATE_MANUAL_FEED = 'manual_feed'
 STATE_MANUAL_RETRACT = 'manual_retract'
 
-# TMC2209 register addresses
+# TMC2208/2225 register addresses
 REG_GCONF = 0x00
 REG_VACTUAL = 0x22
 GCONF_SHAFT_BIT = 3
 
 
 class BufferMotor:
-    """Controls buffer stepper motor via TMC2209 VACTUAL register writes."""
+    """Controls buffer stepper motor via TMC2208 VACTUAL register writes."""
     def __init__(self, config, printer):
         self.printer = printer
         self.stepper_name = config.get('stepper')
@@ -43,7 +43,7 @@ class BufferMotor:
 
     def handle_ready(self):
         stepper_key = 'manual_stepper %s' % self.stepper_name
-        tmc_key = 'tmc2209 %s' % stepper_key
+        tmc_key = 'tmc2208 %s' % stepper_key
         self.manual_stepper = self.printer.lookup_object(stepper_key)
         tmc_obj = self.printer.lookup_object(tmc_key)
         self.mcu_tmc = tmc_obj.mcu_tmc
