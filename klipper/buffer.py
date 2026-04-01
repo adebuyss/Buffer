@@ -40,6 +40,8 @@ class BufferMotor:
         self.manual_stepper = None
         self.current_direction = STOP
         self._enabled = False
+        self._last_shaft = -1
+        self._last_vactual = -1
 
     def handle_ready(self):
         stepper_key = 'manual_stepper %s' % self.stepper_name
@@ -77,20 +79,25 @@ class BufferMotor:
     def set_velocity(self, direction, vactual_override=None):
         """Set motor direction and speed. direction: FORWARD, BACK, or STOP."""
         if direction == STOP:
-            self._write_vactual(0)
-            self.current_direction = STOP
-            self.disable()
+            if self.current_direction != STOP:
+                self._write_vactual(0)
+                self.current_direction = STOP
+                self.disable()
             return
+        vactual = vactual_override if vactual_override is not None \
+            else self.vactual_value
         # If changing between forward/back, stop first
         if (self.current_direction != STOP
                 and self.current_direction != direction):
             self._write_vactual(0)
         self.enable()
         shaft_val = 1 if direction == FORWARD else 0
-        self._write_shaft(shaft_val)
-        vactual = vactual_override if vactual_override is not None \
-            else self.vactual_value
-        self._write_vactual(vactual)
+        # Only write shaft if direction actually changed
+        if shaft_val != self._last_shaft:
+            self._write_shaft(shaft_val)
+        # Only write vactual if value actually changed
+        if vactual != self._last_vactual:
+            self._write_vactual(vactual)
         self.current_direction = direction
 
     def _write_vactual(self, value):
@@ -99,6 +106,7 @@ class BufferMotor:
         for attempt in range(3):
             try:
                 self.mcu_tmc.set_register('VACTUAL', value)
+                self._last_vactual = value
                 return
             except Exception:
                 if attempt == 2:
@@ -109,9 +117,9 @@ class BufferMotor:
         if self.mcu_tmc is None:
             return
         try:
-            # Use Klipper's field helper for correct bit layout
             reg_val = self.mcu_tmc.fields.set_field('shaft', shaft_val)
             self.mcu_tmc.set_register('GCONF', reg_val)
+            self._last_shaft = shaft_val
         except Exception as e:
             logging.warning("buffer: GCONF shaft write failed: %s" % e)
 
@@ -122,6 +130,8 @@ class BufferMotor:
             pass
         self.current_direction = STOP
         self._enabled = False
+        self._last_shaft = -1
+        self._last_vactual = -1
 
 
 class Buffer:
