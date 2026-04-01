@@ -158,6 +158,7 @@ class Buffer:
         self.burst_delay = config.getfloat(
             'burst_delay', 0.5, minval=0.)
         self.pause_on_runout = config.getboolean('pause_on_runout', True)
+        self.debug = config.getboolean('debug', False)
         self.control_interval = config.getfloat(
             'control_interval', 0.1, above=0.)
 
@@ -281,7 +282,16 @@ class Buffer:
 
     def _make_sensor_callback(self, sensor_name):
         def callback(eventtime, state):
-            self.sensor_states[sensor_name] = bool(state)
+            # buttons module reports post-inversion pin level;
+            # with ^! pins, state=0 means sensor blocked (triggered)
+            self.sensor_states[sensor_name] = not bool(state)
+            if self.debug:
+                self.gcode.respond_info(
+                    "Buffer debug: %s=%s -> empty=%s middle=%s full=%s"
+                    % (sensor_name, self.sensor_states[sensor_name],
+                       self.sensor_states['empty'],
+                       self.sensor_states['middle'],
+                       self.sensor_states['full']))
             if self.auto_enabled:
                 self._update_extruder_velocity(eventtime)
                 self._evaluate_and_drive(eventtime)
