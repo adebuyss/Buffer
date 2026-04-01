@@ -233,32 +233,24 @@ class Buffer:
 
     def _register_sensors(self, config):
         buttons = self.printer.load_object(config, 'buttons')
-        ppins = self.printer.lookup_object('pins')
         # Hall sensors
         for sensor_name, pin_name in [
                 ('empty', self.sensor_empty_pin),
                 ('middle', self.sensor_middle_pin),
                 ('full', self.sensor_full_pin)]:
-            pin_params = ppins.parse_pin(pin_name,
-                                         can_invert=True, can_pullup=True)
             buttons.register_buttons(
-                [pin_params],
+                [pin_name],
                 self._make_sensor_callback(sensor_name))
         # Material switch
-        mat_params = ppins.parse_pin(self.material_switch_pin,
-                                     can_invert=True, can_pullup=True)
-        buttons.register_buttons([mat_params], self._material_callback)
+        buttons.register_buttons(
+            [self.material_switch_pin], self._material_callback)
         # Manual buttons
         if self.feed_button_pin is not None:
-            feed_params = ppins.parse_pin(self.feed_button_pin,
-                                          can_invert=True, can_pullup=True)
             buttons.register_buttons(
-                [feed_params], self._feed_button_callback)
+                [self.feed_button_pin], self._feed_button_callback)
         if self.retract_button_pin is not None:
-            ret_params = ppins.parse_pin(self.retract_button_pin,
-                                         can_invert=True, can_pullup=True)
             buttons.register_buttons(
-                [ret_params], self._retract_button_callback)
+                [self.retract_button_pin], self._retract_button_callback)
 
     def _handle_ready(self):
         self.motor.handle_ready()
