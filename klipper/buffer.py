@@ -252,7 +252,7 @@ class Buffer:
         # Initialize extruder tracking
         try:
             extruder = self.printer.lookup_object('extruder')
-            self._last_extruder_pos = extruder.last_position
+            self._last_extruder_pos = extruder.last_position[3]
         except Exception:
             self._last_extruder_pos = 0.
         self._last_ext_time = self.reactor.monotonic()
@@ -354,7 +354,7 @@ class Buffer:
     def _update_extruder_velocity(self, eventtime):
         try:
             extruder = self.printer.lookup_object('extruder')
-            cur_pos = extruder.last_position
+            cur_pos = extruder.last_position[3]
         except Exception:
             self.extruder_velocity = 0.
             return
@@ -634,7 +634,7 @@ class Buffer:
         # Reset extruder tracking
         try:
             extruder = self.printer.lookup_object('extruder')
-            self._last_extruder_pos = extruder.last_position
+            self._last_extruder_pos = extruder.last_position[3]
         except Exception:
             pass
         self._last_ext_time = self.reactor.monotonic()
