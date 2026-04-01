@@ -278,14 +278,27 @@ class Buffer:
         return callback
 
     def _material_callback(self, eventtime, state):
-        # Material switch: LOW (0) = present, HIGH (1) = absent
-        # Pin is configured with inversion so state=1 means present
+        was_present = self.material_present
         self.material_present = bool(state)
         if not self.material_present and self.auto_enabled:
             self._stop_motor()
             self.state = STATE_IDLE
             if self.pause_on_runout:
                 self._trigger_pause("buffer: filament runout detected")
+        elif self.material_present and not was_present:
+            # Filament inserted - auto-enable and start initial fill
+            self.auto_enabled = True
+            self.state = STATE_STOPPED
+            self.error_msg = ''
+            self._burst_count = 0
+            self._burst_delay_start = 0.
+            self._burst_until = 0.
+            self._extruder_retracting = False
+            logging.info("buffer: filament detected, auto-enabled")
+            self.gcode.respond_info(
+                "Buffer: filament detected, starting fill")
+            self._update_extruder_velocity(eventtime)
+            self._evaluate_and_drive(eventtime)
 
     def _feed_button_callback(self, eventtime, state):
         # Active LOW button, pin inverted: state=1 means pressed
