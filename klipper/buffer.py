@@ -281,9 +281,7 @@ class Buffer:
 
     def _make_sensor_callback(self, sensor_name):
         def callback(eventtime, state):
-            # buttons module reports post-inversion pin level;
-            # with ^! pins, state=0 means sensor blocked (triggered)
-            self.sensor_states[sensor_name] = not bool(state)
+            self.sensor_states[sensor_name] = bool(state)
             if self.auto_enabled:
                 self._update_extruder_velocity(eventtime)
                 self._evaluate_and_drive(eventtime)
