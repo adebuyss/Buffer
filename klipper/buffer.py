@@ -40,7 +40,6 @@ class BufferMotor:
         self.manual_stepper = None
         self.current_direction = STOP
         self._enabled = False
-        self._cached_gconf = None
 
     def handle_ready(self):
         stepper_key = 'manual_stepper %s' % self.stepper_name
@@ -48,8 +47,6 @@ class BufferMotor:
         self.manual_stepper = self.printer.lookup_object(stepper_key)
         tmc_obj = self.printer.lookup_object(tmc_key)
         self.mcu_tmc = tmc_obj.mcu_tmc
-        # Cache GCONF to avoid read-modify-write on every direction change
-        self._cached_gconf = self.mcu_tmc.get_register('GCONF')
         # Read microsteps from the TMC config
         chopconf = self.mcu_tmc.get_register('CHOPCONF')
         mres = (chopconf >> 24) & 0x0F
@@ -112,13 +109,11 @@ class BufferMotor:
         if self.mcu_tmc is None:
             return
         try:
-            mask = 1 << GCONF_SHAFT_BIT
-            gconf = ((self._cached_gconf or 0) & ~mask) \
-                | (shaft_val << GCONF_SHAFT_BIT)
-            self.mcu_tmc.set_register('GCONF', gconf)
-            self._cached_gconf = gconf
-        except Exception:
-            logging.warning("buffer: GCONF shaft write failed")
+            # Use Klipper's field helper for correct bit layout
+            reg_val = self.mcu_tmc.fields.set_field('shaft', shaft_val)
+            self.mcu_tmc.set_register('GCONF', reg_val)
+        except Exception as e:
+            logging.warning("buffer: GCONF shaft write failed: %s" % e)
 
     def emergency_stop(self):
         try:
