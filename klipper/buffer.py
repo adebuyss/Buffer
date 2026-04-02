@@ -418,8 +418,12 @@ class Buffer:
         vactual_override = None
         new_direction = STOP
 
+        # Priority: empty > full-only > full+middle overlap > middle > no sensors
+        # Overlap zones (two adjacent sensors triggered) are normal during
+        # carriage travel and get transitional behavior.
+
         if empty:
-            # Buffer near empty
+            # Buffer near empty — full speed feed / burst
             self._in_full_zone = False
             self._full_zone_feed_time = 0.
             if self.extruder_velocity > self.min_velocity:
@@ -450,9 +454,8 @@ class Buffer:
                 # First time empty while stopped - start delay
                 self._burst_delay_start = eventtime
                 new_direction = STOP
-        elif full:
-            # Buffer near full - slow down proportionally first,
-            # only retract after full_zone_timeout of active feeding
+        elif full and not middle:
+            # Deep full zone — slow down, timeout, then retract
             self._burst_delay_start = 0.
             self._burst_until = 0.
             self._burst_count = 0
@@ -477,6 +480,19 @@ class Buffer:
             else:
                 # Not extruding and in full zone - just stop
                 self._last_full_feed_time = 0.
+                new_direction = STOP
+        elif full and middle:
+            # Overlap transition zone — slow down but no timeout/retract
+            self._in_full_zone = False
+            self._full_zone_feed_time = 0.
+            self._burst_delay_start = 0.
+            self._burst_until = 0.
+            self._burst_count = 0
+            if self.extruder_velocity > self.min_velocity:
+                new_direction = FORWARD
+                vactual_override = self._velocity_to_vactual(
+                    self.extruder_velocity * self.slowdown_factor)
+            else:
                 new_direction = STOP
         elif middle:
             # In the ideal zone - match extruder velocity
