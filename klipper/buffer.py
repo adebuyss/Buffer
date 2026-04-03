@@ -8,6 +8,7 @@
 # License: GPLv3
 
 import logging
+import math
 
 FORWARD = 'forward'
 BACK = 'back'
@@ -160,7 +161,7 @@ class Buffer:
         self.follow_retract = config.getboolean('follow_retract', True)
         self.debug = config.getboolean('debug', False)
         self.control_interval = config.getfloat(
-            'control_interval', 0.1, above=0.)
+            'control_interval', 0.5, above=0.)
 
         # Sensor pin names (resolved at ready time via buttons)
         self.sensor_empty_pin = config.get('sensor_empty_pin')
@@ -186,8 +187,9 @@ class Buffer:
         self.motor_direction = STOP
         self.extruder_velocity = 0.
         self.motor_rpm = 0.
-        self._last_extruder_pos = 0.
         self._last_ext_time = 0.
+        self._last_e_command_time = 0.
+        self._expected_move_end = 0.
         self._feed_button_pressed = False
         self._retract_button_pressed = False
         self._full_zone_feed_time = 0.
@@ -201,6 +203,13 @@ class Buffer:
 
         # Print state tracking
         self._print_stats = None
+
+        # Gcode move hooks
+        self._gcode_move = None
+        self._orig_G0 = None
+        self._orig_G1 = None
+        self._orig_G2 = None
+        self._orig_G3 = None
 
         # Timer handle
         self._control_timer = None
@@ -263,12 +272,6 @@ class Buffer:
 
     def _handle_ready(self):
         self.motor.handle_ready()
-        # Initialize extruder tracking
-        try:
-            toolhead = self.printer.lookup_object('toolhead')
-            self._last_extruder_pos = toolhead.get_position()[3]
-        except Exception:
-            self._last_extruder_pos = 0.
         self._last_ext_time = self.reactor.monotonic()
         # Look up print_stats for printing vs idle detection
         try:
@@ -276,7 +279,15 @@ class Buffer:
         except Exception:
             logging.info("buffer: print_stats not available, "
                          "retraction following disabled")
-        # Start control timer
+        # Hook G0/G1/G2/G3 for immediate E movement detection
+        self._gcode_move = self.printer.lookup_object('gcode_move')
+        handlers = self.gcode.ready_gcode_handlers
+        for cmd in ('G0', 'G1', 'G2', 'G3'):
+            orig = handlers.get(cmd)
+            if orig:
+                setattr(self, '_orig_' + cmd, orig)
+                self.gcode.register_command(cmd, self._cmd_move_wrapper)
+        # Start control timer (watchdog for timeouts, bursts, decay)
         self._control_timer = self.reactor.register_timer(
             self._control_timer_cb, self.reactor.monotonic() + 1.)
         logging.info("buffer: ready")
@@ -288,11 +299,84 @@ class Buffer:
         return self._print_stats.get_status(
             self.reactor.monotonic())['state'] == "printing"
 
+    # --- Gcode move hooks ---
+
+    def _cmd_move_wrapper(self, gcmd):
+        """Intercept G0/G1/G2/G3 to detect E movement immediately."""
+        cmd = gcmd.get_command()
+        orig = getattr(self, '_orig_' + cmd, None)
+        if orig is None:
+            return
+        prev_pos = list(self._gcode_move.last_position)
+        orig(gcmd)  # updates last_position, queues move
+        new_e = self._gcode_move.last_position[3]
+        e_delta = new_e - prev_pos[3]
+        if abs(e_delta) > 0.001 and self.auto_enabled:
+            self._on_e_movement(e_delta, prev_pos)
+
+    def _on_e_movement(self, e_delta, prev_pos):
+        """Process detected E movement: compute velocity and drive motor."""
+        eventtime = self.reactor.monotonic()
+        self._last_e_command_time = eventtime
+
+        # Compute E velocity from commanded path speed
+        gm = self._gcode_move
+        speed = gm.speed  # mm/s (F/60 * speed_factor), persists across cmds
+
+        # Klipper applies F to XYZ path, not XYZE
+        curr = gm.last_position
+        dx = curr[0] - prev_pos[0]
+        dy = curr[1] - prev_pos[1]
+        dz = curr[2] - prev_pos[2]
+        xyz_dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+
+        if xyz_dist > 0.001:
+            # Mixed XYZ+E move: E velocity proportional to E/XYZ ratio
+            e_velocity = speed * abs(e_delta) / xyz_dist
+        elif abs(e_delta) > 0.001:
+            # Pure E move (retraction, load/unload): speed applies to E
+            e_velocity = speed
+        else:
+            # Fallback: time-based estimate
+            dt = eventtime - self._last_ext_time
+            e_velocity = abs(e_delta) / max(dt, 0.001)
+
+        self._last_ext_time = eventtime
+
+        # Estimate move duration for velocity decay timing
+        move_dist = xyz_dist if xyz_dist > 0.001 else abs(e_delta)
+        if speed > 0.:
+            self._expected_move_end = eventtime + move_dist / speed
+
+        # Update buffer state
+        if e_delta > 0.:
+            self.extruder_velocity = e_velocity
+            self._extruder_retracting = False
+        else:
+            if self.follow_retract and not self._is_printing():
+                self.extruder_velocity = e_velocity
+                self._extruder_retracting = True
+            else:
+                self._extruder_retracting = True
+                self.extruder_velocity = 0.
+                if self.motor_direction == FORWARD:
+                    self._stop_motor()
+                    self.state = STATE_STOPPED
+                return  # Don't evaluate further during print retraction
+
+        # Drive motor immediately
+        self._evaluate_and_drive(eventtime)
+
     def _handle_shutdown(self):
         self.motor.emergency_stop()
         self.state = STATE_DISABLED
         self.auto_enabled = False
         logging.info("buffer: shutdown - motor stopped")
+
+    def _update_extruder_velocity(self, eventtime):
+        """Refresh extruder velocity estimate. No-op — velocity is already
+        updated in real time via G-code move hooks (_on_e_movement)."""
+        pass
 
     # --- Sensor callbacks ---
 
@@ -382,42 +466,20 @@ class Buffer:
                     "Continuous forward motion exceeded %.0fs timeout"
                     % self.forward_timeout)
                 return eventtime + self.control_interval
-        # Compute extruder velocity and drive
-        self._update_extruder_velocity(eventtime)
-        self._evaluate_and_drive(eventtime)
-        return eventtime + self.control_interval
-
-    def _update_extruder_velocity(self, eventtime):
-        try:
-            toolhead = self.printer.lookup_object('toolhead')
-            cur_pos = toolhead.get_position()[3]  # E axis
-        except Exception:
+        # Velocity decay: stop motor once the last move should have
+        # completed and no new G1 has arrived
+        if (self.extruder_velocity > 0.
+                and eventtime > self._expected_move_end
+                and eventtime - self._last_e_command_time
+                    > self.control_interval):
             self.extruder_velocity = 0.
-            return
-        dt = eventtime - self._last_ext_time
-        if dt > 0.001:
-            delta = cur_pos - self._last_extruder_pos
-            if delta > 0.:
-                self.extruder_velocity = delta / dt  # mm/s
-                self._extruder_retracting = False
-            elif delta < -0.01:
-                if self.follow_retract and not self._is_printing():
-                    # Not printing: compute retraction velocity for
-                    # buffer to follow (positive magnitude)
-                    self.extruder_velocity = -delta / dt
-                    self._extruder_retracting = True
-                else:
-                    # Printing: stop buffer motor on retraction
-                    self.extruder_velocity = 0.
-                    if not self._extruder_retracting:
-                        self._extruder_retracting = True
-                        if self.motor_direction == FORWARD:
-                            self._stop_motor()
-                            self.state = STATE_STOPPED
-            else:
-                self.extruder_velocity = 0.
-            self._last_extruder_pos = cur_pos
-            self._last_ext_time = eventtime
+            self._extruder_retracting = False
+            self._evaluate_and_drive(eventtime)
+        # Burst/full-zone timing still needs periodic evaluation
+        if (self.sensor_states['empty'] or self._in_full_zone
+                or self._burst_until > 0.):
+            self._evaluate_and_drive(eventtime)
+        return eventtime + self.control_interval
 
     def _evaluate_and_drive(self, eventtime):
         if not self.auto_enabled or not self.material_present:
@@ -710,13 +772,10 @@ class Buffer:
         self._burst_until = 0.
         self._burst_count = 0
         self._extruder_retracting = False
-        # Reset extruder tracking
-        try:
-            toolhead = self.printer.lookup_object('toolhead')
-            self._last_extruder_pos = toolhead.get_position()[3]
-        except Exception:
-            pass
+        # Reset timing state
         self._last_ext_time = self.reactor.monotonic()
+        self._last_e_command_time = 0.
+        self._expected_move_end = 0.
         gcmd.respond_info("Buffer: automatic control enabled")
 
     def cmd_BUFFER_DISABLE(self, gcmd):
