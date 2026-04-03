@@ -157,6 +157,7 @@ class Buffer:
         self.burst_delay = config.getfloat(
             'burst_delay', 0.5, minval=0.)
         self.pause_on_runout = config.getboolean('pause_on_runout', True)
+        self.follow_retract = config.getboolean('follow_retract', True)
         self.debug = config.getboolean('debug', False)
         self.control_interval = config.getfloat(
             'control_interval', 0.1, above=0.)
@@ -197,6 +198,9 @@ class Buffer:
         self._burst_until = 0.
         self._burst_count = 0
         self._max_burst_cycles = 5
+
+        # Print state tracking
+        self._print_stats = None
 
         # Timer handle
         self._control_timer = None
@@ -266,10 +270,23 @@ class Buffer:
         except Exception:
             self._last_extruder_pos = 0.
         self._last_ext_time = self.reactor.monotonic()
+        # Look up print_stats for printing vs idle detection
+        try:
+            self._print_stats = self.printer.lookup_object('print_stats')
+        except Exception:
+            logging.info("buffer: print_stats not available, "
+                         "retraction following disabled")
         # Start control timer
         self._control_timer = self.reactor.register_timer(
             self._control_timer_cb, self.reactor.monotonic() + 1.)
         logging.info("buffer: ready")
+
+    def _is_printing(self):
+        """Return True if a print job is actively running."""
+        if self._print_stats is None:
+            return True  # Conservative fallback: assume printing
+        return self._print_stats.get_status(
+            self.reactor.monotonic())['state'] == "printing"
 
     def _handle_shutdown(self):
         self.motor.emergency_stop()
@@ -384,13 +401,19 @@ class Buffer:
                 self.extruder_velocity = delta / dt  # mm/s
                 self._extruder_retracting = False
             elif delta < -0.01:
-                # Retraction detected - immediately stop buffer motor
-                self.extruder_velocity = 0.
-                if not self._extruder_retracting:
+                if self.follow_retract and not self._is_printing():
+                    # Not printing: compute retraction velocity for
+                    # buffer to follow (positive magnitude)
+                    self.extruder_velocity = -delta / dt
                     self._extruder_retracting = True
-                    if self.motor_direction == FORWARD:
-                        self._stop_motor()
-                        self.state = STATE_STOPPED
+                else:
+                    # Printing: stop buffer motor on retraction
+                    self.extruder_velocity = 0.
+                    if not self._extruder_retracting:
+                        self._extruder_retracting = True
+                        if self.motor_direction == FORWARD:
+                            self._stop_motor()
+                            self.state = STATE_STOPPED
             else:
                 self.extruder_velocity = 0.
             self._last_extruder_pos = cur_pos
@@ -401,6 +424,22 @@ class Buffer:
             return
         if self.state in (STATE_MANUAL_FEED, STATE_MANUAL_RETRACT,
                           STATE_ERROR, STATE_DISABLED):
+            return
+
+        # When not printing and extruder is retracting, follow retraction
+        if (self._extruder_retracting and self.follow_retract
+                and not self._is_printing()):
+            if self.extruder_velocity > self.min_velocity:
+                vactual = self._velocity_to_vactual(
+                    self.extruder_velocity * self.correction_factor)
+                if self.motor_direction != BACK:
+                    self._set_motor(BACK, vactual)
+                elif vactual != self.motor._last_vactual:
+                    self.motor.set_velocity(BACK, vactual)
+            else:
+                if self.motor_direction != STOP:
+                    self._stop_motor()
+                    self.state = STATE_STOPPED
             return
 
         empty = self.sensor_states['empty']
@@ -623,6 +662,8 @@ class Buffer:
             'slowdown_factor': self.slowdown_factor,
             'burst_active': self._burst_until > 0.
                 and self.reactor.monotonic() < self._burst_until,
+            'is_printing': self._is_printing(),
+            'extruder_retracting': self._extruder_retracting,
         }
 
     # --- Gcode commands ---
@@ -639,7 +680,8 @@ class Buffer:
                "  Speed RPM: %.0f\n"
                "  Forward elapsed: %.1f / %.0f s\n"
                "  Full zone: %s (feed %.1f / %.0f s)\n"
-               "  Burst active: %s"
+               "  Burst active: %s\n"
+               "  Printing: %s  Retracting: %s"
                % (status['state'], status['motor_direction'],
                   status['sensor_empty'], status['sensor_middle'],
                   status['sensor_full'], status['material_present'],
@@ -649,7 +691,9 @@ class Buffer:
                   status['in_full_zone'],
                   status['full_zone_feed_time'],
                   status['full_zone_timeout'],
-                  status['burst_active']))
+                  status['burst_active'],
+                  status['is_printing'],
+                  status['extruder_retracting']))
         if status['error']:
             msg += "\n  ERROR: %s" % status['error']
         gcmd.respond_info(msg)
