@@ -373,6 +373,11 @@ class Buffer:
         self.auto_enabled = False
         logging.info("buffer: shutdown - motor stopped")
 
+    def _update_extruder_velocity(self, eventtime):
+        """Refresh extruder velocity estimate. No-op — velocity is already
+        updated in real time via G-code move hooks (_on_e_movement)."""
+        pass
+
     # --- Sensor callbacks ---
 
     def _make_sensor_callback(self, sensor_name):
