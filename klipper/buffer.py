@@ -54,6 +54,11 @@ class BufferMotor:
         mres = (chopconf >> 24) & 0x0F
         self.microsteps = 256 >> mres
         self._update_vactual_value(self.speed_rpm)
+        # Enable motor once at startup - use VACTUAL=0 for stop
+        # instead of toggling enable pin (which triggers full TMC
+        # register re-init and overwhelms the MCU UART)
+        self.manual_stepper.do_enable(True)
+        self._write_vactual(0)
 
     def _update_vactual_value(self, rpm):
         # Match original firmware formula: RPM * microsteps * 200 / 60 / 0.715
@@ -67,14 +72,10 @@ class BufferMotor:
         self._update_vactual_value(rpm)
 
     def enable(self):
-        if not self._enabled:
-            self.manual_stepper.do_enable(True)
-            self._enabled = True
+        pass
 
     def disable(self):
-        if self._enabled:
-            self.manual_stepper.do_enable(False)
-            self._enabled = False
+        pass
 
     def set_velocity(self, direction, vactual_override=None):
         """Set motor direction and speed. direction: FORWARD, BACK, or STOP."""
@@ -82,7 +83,6 @@ class BufferMotor:
             if self.current_direction != STOP:
                 self._write_vactual(0)
                 self.current_direction = STOP
-                self.disable()
             return
         vactual = vactual_override if vactual_override is not None \
             else self.vactual_value
@@ -90,7 +90,6 @@ class BufferMotor:
         if (self.current_direction != STOP
                 and self.current_direction != direction):
             self._write_vactual(0)
-        self.enable()
         shaft_val = 1 if direction == FORWARD else 0
         # Only write shaft if direction actually changed
         if shaft_val != self._last_shaft:
