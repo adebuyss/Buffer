@@ -98,6 +98,56 @@ class TestFullZoneTimeout:
         assert enabled_buf.state == STATE_RETRACTING
 
 
+class TestFullZoneRetractLength:
+    def test_retract_stops_after_configured_length(self, enabled_buf, reactor):
+        """With full_zone_retract_length set, retract stops after that
+        distance instead of running until middle sensor."""
+        enabled_buf.full_zone_retract_length = 50.0  # 50mm
+        set_sensors(enabled_buf, full=True)
+        t = 10.0
+        reactor._monotonic = t
+        enabled_buf.extruder_velocity = 5.0
+
+        # Build up feed time past timeout
+        enabled_buf._evaluate_and_drive(t)
+        for i in range(1, 10):
+            t += 0.5
+            reactor._monotonic = t
+            enabled_buf._evaluate_and_drive(t)
+
+        assert enabled_buf.motor_direction == BACK
+        retract_start = t
+
+        # At 260 RPM, rotation_distance=23.2:
+        # retract_speed = 260 * 23.2 / 60 ≈ 100.5 mm/s
+        # time for 50mm ≈ 0.5s
+        t += 0.6
+        reactor._monotonic = t
+        enabled_buf._evaluate_and_drive(t)
+        assert enabled_buf.motor_direction == STOP
+
+    def test_zero_length_retracts_indefinitely(self, enabled_buf, reactor):
+        """Default (0) means retract until sensor clears."""
+        assert enabled_buf.full_zone_retract_length == 0.
+        set_sensors(enabled_buf, full=True)
+        t = 10.0
+        reactor._monotonic = t
+        enabled_buf.extruder_velocity = 5.0
+
+        enabled_buf._evaluate_and_drive(t)
+        for i in range(1, 10):
+            t += 0.5
+            reactor._monotonic = t
+            enabled_buf._evaluate_and_drive(t)
+
+        assert enabled_buf.motor_direction == BACK
+        # Continue calling — should keep retracting (no auto-stop)
+        t += 5.0
+        reactor._monotonic = t
+        enabled_buf._evaluate_and_drive(t)
+        assert enabled_buf.motor_direction == BACK
+
+
 class TestFullZoneLeaving:
     def test_full_middle_overlap_clears_full_zone(self, enabled_buf, reactor):
         set_sensors(enabled_buf, full=True)

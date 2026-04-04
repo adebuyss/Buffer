@@ -151,6 +151,8 @@ class Buffer:
             'slowdown_factor', 0.5, above=0., below=1.)
         self.full_zone_timeout = config.getfloat(
             'full_zone_timeout', 3.0, above=0.)
+        self.full_zone_retract_length = config.getfloat(
+            'full_zone_retract_length', 0., minval=0.)
         self.min_velocity = config.getfloat(
             'min_extrusion_velocity', 0.05, minval=0.)
         self.burst_feed_time = config.getfloat(
@@ -199,6 +201,7 @@ class Buffer:
         self._full_zone_feed_time = 0.
         self._last_full_feed_time = 0.
         self._in_full_zone = False
+        self._full_zone_retract_start = 0.
         self._extruder_retracting = False
         self._burst_delay_start = 0.
         self._burst_until = 0.
@@ -629,10 +632,30 @@ class Buffer:
                 self._in_full_zone = True
                 self._full_zone_feed_time = 0.
                 self._last_full_feed_time = 0.
+                self._full_zone_retract_start = 0.
             if self._full_zone_feed_time >= self.full_zone_timeout:
                 # Timeout exceeded - actively retract
-                new_direction = BACK
-                vactual_override = None  # Use configured speed_rpm
+                if (self.full_zone_retract_length > 0.
+                        and self._full_zone_retract_start > 0.):
+                    # Check if we've retracted long enough
+                    try:
+                        ms = self.motor.manual_stepper
+                        rd = ms.steppers[0].get_rotation_distance()[0]
+                    except Exception:
+                        rd = 23.2
+                    retract_speed = self.motor.speed_rpm * rd / 60.
+                    elapsed = eventtime - self._full_zone_retract_start
+                    if elapsed * retract_speed >= self.full_zone_retract_length:
+                        new_direction = STOP
+                        self._full_zone_retract_start = 0.
+                    else:
+                        new_direction = BACK
+                        vactual_override = None
+                else:
+                    new_direction = BACK
+                    vactual_override = None  # Use configured speed_rpm
+                    if self.full_zone_retract_length > 0.:
+                        self._full_zone_retract_start = eventtime
             elif self._smoothed_velocity(eventtime) > self.min_velocity:
                 # Still extruding - slow down feed proportionally
                 new_direction = FORWARD
@@ -803,6 +826,7 @@ class Buffer:
             'in_full_zone': self._in_full_zone,
             'full_zone_feed_time': round(self._full_zone_feed_time, 1),
             'full_zone_timeout': self.full_zone_timeout,
+            'full_zone_retract_length': self.full_zone_retract_length,
             'slowdown_factor': self.slowdown_factor,
             'burst_active': self._burst_until > 0.
                 and self.reactor.monotonic() < self._burst_until,
