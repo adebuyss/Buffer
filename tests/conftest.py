@@ -41,13 +41,22 @@ class MockReactor:
     def __init__(self):
         self._monotonic = 0.0
         self._timers = []  # [(callback, waketime)]
+        self._pending_callbacks = []  # deferred callbacks
 
     def monotonic(self):
         return self._monotonic
 
     def advance_time(self, seconds):
         self._monotonic += seconds
+        self._fire_callbacks()
         self._fire_timers()
+
+    def _fire_callbacks(self):
+        """Fire all pending deferred callbacks (registered via
+        register_callback) in FIFO order."""
+        while self._pending_callbacks:
+            cb = self._pending_callbacks.pop(0)
+            cb(self._monotonic)
 
     def _fire_timers(self):
         for i, (cb, wake) in enumerate(list(self._timers)):
@@ -55,6 +64,15 @@ class MockReactor:
                 next_wake = cb(self._monotonic)
                 if next_wake is not None:
                     self._timers[i] = (cb, next_wake)
+
+    def register_callback(self, callback):
+        """Queue a callback to fire on the next reactor iteration
+        (simulated by advance_time or flush_callbacks)."""
+        self._pending_callbacks.append(callback)
+
+    def flush_callbacks(self):
+        """Fire pending callbacks without advancing time."""
+        self._fire_callbacks()
 
     def register_timer(self, callback, waketime):
         handle = len(self._timers)
@@ -126,7 +144,7 @@ class MockConfig:
         raise KeyError(key)
 
     def getfloat(self, key, default=_SENTINEL, minval=None, above=None,
-                 below=None):
+                 below=None, maxval=None):
         if key in self._values:
             return float(self._values[key])
         if default is not _SENTINEL:
@@ -367,7 +385,9 @@ def trigger_sensor(buttons, pin, triggered, eventtime):
 
 
 def simulate_e_move(b, e_delta, xyz_dist=0.0, speed=50.0):
-    """Simulate a G1 move with E component by calling _on_e_movement."""
+    """Simulate a G1 move with E component by calling _on_e_movement.
+    Flushes deferred drive callbacks so motor writes happen immediately
+    in tests (mirrors reactor iteration after gcode handler returns)."""
     gm = b._gcode_move
     prev_pos = list(gm.last_position)
     gm.speed = speed
@@ -375,3 +395,4 @@ def simulate_e_move(b, e_delta, xyz_dist=0.0, speed=50.0):
     if xyz_dist > 0:
         gm.last_position[0] += xyz_dist
     b._on_e_movement(e_delta, prev_pos)
+    b.reactor.flush_callbacks()
