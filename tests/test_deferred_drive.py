@@ -125,19 +125,24 @@ class TestControlTimerCatchUp:
 
 
 class TestDeferredRetraction:
-    def test_retraction_during_print_defers_stop(self, enabled_buf, reactor):
-        """Retraction during printing should defer motor stop via callback."""
+    def test_retraction_during_print_preserves_velocity(
+            self, enabled_buf, reactor):
+        """Retraction during printing should preserve smoothed velocity
+        so motor keeps running through brief infill retractions."""
         set_sensors(enabled_buf, middle=True)
         reactor._monotonic = 10.0
         enabled_buf._print_stats.state = "printing"
         simulate_e_move(enabled_buf, e_delta=1.0, xyz_dist=10.0, speed=50.0)
         assert enabled_buf.motor_direction == FORWARD
+        prev_velocity = enabled_buf.extruder_velocity
 
-        # Now retract — should defer the stop
+        # Now retract — smoothed velocity should be preserved
         reactor._monotonic = 10.15
         simulate_e_move(enabled_buf, e_delta=-2.0, xyz_dist=0.0, speed=30.0)
         assert enabled_buf._extruder_retracting is True
-        assert enabled_buf.extruder_velocity == 0.0
+        # Smoothed velocity keeps the previous forward velocity
+        assert enabled_buf.extruder_velocity == pytest.approx(
+            prev_velocity, abs=0.1)
 
 
 class TestSensorCallbacksUnchanged:

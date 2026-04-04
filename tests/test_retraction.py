@@ -26,15 +26,24 @@ class TestRetractionFollowing:
         enabled_buf._evaluate_and_drive(10.0)
         assert enabled_buf.motor_direction == STOP
 
-    def test_printing_retraction_stops_motor(self, enabled_buf, reactor):
+    def test_printing_retraction_preserves_smoothed_velocity(
+            self, enabled_buf, reactor):
         enabled_buf._print_stats.state = "printing"
         set_sensors(enabled_buf, middle=True)
         reactor._monotonic = 10.0
         enabled_buf.motor_direction = FORWARD
         enabled_buf.state = STATE_STOPPED
+        # First extrude to populate the velocity window
+        simulate_e_move(enabled_buf, e_delta=1.0, xyz_dist=10.0, speed=50.0)
+        prev_velocity = enabled_buf.extruder_velocity
+        assert prev_velocity > 0
+        # Now retract — should preserve smoothed velocity
+        reactor._monotonic = 10.05
         simulate_e_move(enabled_buf, e_delta=-2.0, xyz_dist=0.0, speed=30.0)
         assert enabled_buf._extruder_retracting is True
-        assert enabled_buf.extruder_velocity == 0.0
+        # Velocity preserved via smoothing window, not zeroed
+        assert enabled_buf.extruder_velocity == pytest.approx(
+            prev_velocity, abs=0.1)
 
     def test_follow_retract_disabled(self, enabled_buf, reactor):
         enabled_buf.follow_retract = False
