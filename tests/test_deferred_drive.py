@@ -58,8 +58,9 @@ class TestRateLimiting:
         gm.last_position[3] += 0.5
         gm.last_position[0] += 10.0
         enabled_buf._on_e_movement(0.5, prev_pos)
-        # Should NOT have scheduled another callback
-        assert enabled_buf._drive_pending is False
+        # Rate-limited: schedules a timer instead of immediate callback
+        assert enabled_buf._drive_pending is True
+        # No new immediate callback — timer used instead
         assert len(reactor._pending_callbacks) == 0
 
     def test_after_interval_new_callback_scheduled(self, enabled_buf, reactor):
@@ -125,10 +126,10 @@ class TestControlTimerCatchUp:
 
 
 class TestDeferredRetraction:
-    def test_retraction_during_print_preserves_velocity(
+    def test_retraction_during_print_zeroes_velocity(
             self, enabled_buf, reactor):
-        """Retraction during printing should preserve smoothed velocity
-        so motor keeps running through brief infill retractions."""
+        """Retraction during printing should zero velocity so motor
+        stops during travel retractions."""
         set_sensors(enabled_buf, middle=True)
         reactor._monotonic = 10.0
         enabled_buf._print_stats.state = "printing"
@@ -136,13 +137,12 @@ class TestDeferredRetraction:
         assert enabled_buf.motor_direction == FORWARD
         prev_velocity = enabled_buf.extruder_velocity
 
-        # Now retract — smoothed velocity should be preserved
+        # Now retract — velocity should be zeroed
         reactor._monotonic = 10.15
         simulate_e_move(enabled_buf, e_delta=-2.0, xyz_dist=0.0, speed=30.0)
         assert enabled_buf._extruder_retracting is True
-        # Smoothed velocity keeps the previous forward velocity
-        assert enabled_buf.extruder_velocity == pytest.approx(
-            prev_velocity, abs=0.1)
+        # Velocity zeroed during retraction to prevent stale forward drive
+        assert enabled_buf.extruder_velocity == 0.0
 
 
 class TestSensorCallbacksUnchanged:

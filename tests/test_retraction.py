@@ -26,7 +26,7 @@ class TestRetractionFollowing:
         enabled_buf._evaluate_and_drive(10.0)
         assert enabled_buf.motor_direction == STOP
 
-    def test_printing_retraction_preserves_smoothed_velocity(
+    def test_printing_retraction_zeroes_velocity(
             self, enabled_buf, reactor):
         enabled_buf._print_stats.state = "printing"
         set_sensors(enabled_buf, middle=True)
@@ -37,13 +37,12 @@ class TestRetractionFollowing:
         simulate_e_move(enabled_buf, e_delta=1.0, xyz_dist=10.0, speed=50.0)
         prev_velocity = enabled_buf.extruder_velocity
         assert prev_velocity > 0
-        # Now retract — should preserve smoothed velocity
+        # Now retract — velocity should be zeroed
         reactor._monotonic = 10.05
         simulate_e_move(enabled_buf, e_delta=-2.0, xyz_dist=0.0, speed=30.0)
         assert enabled_buf._extruder_retracting is True
-        # Velocity preserved via smoothing window, not zeroed
-        assert enabled_buf.extruder_velocity == pytest.approx(
-            prev_velocity, abs=0.1)
+        # Velocity zeroed during retraction to prevent stale forward drive
+        assert enabled_buf.extruder_velocity == 0.0
 
     def test_follow_retract_disabled(self, enabled_buf, reactor):
         enabled_buf.follow_retract = False
@@ -67,3 +66,118 @@ class TestRetractionFollowing:
         simulate_e_move(enabled_buf, e_delta=5.0, xyz_dist=0.0, speed=30.0)
         assert enabled_buf._extruder_retracting is False
         assert enabled_buf.extruder_velocity > 0
+
+
+class TestRetractionZhop:
+    """Tests for retraction + z-hop behaviour during printing."""
+
+    def test_travel_retraction_stops_motor(self, enabled_buf, reactor):
+        """Retract during print, wait 0.25s (timer fires) → motor stops."""
+        enabled_buf._print_stats.state = "printing"
+        set_sensors(enabled_buf, middle=True)
+        reactor._monotonic = 10.0
+        # Extrude to set up forward motion
+        simulate_e_move(enabled_buf, e_delta=1.0, xyz_dist=10.0, speed=50.0)
+        assert enabled_buf.motor_direction == FORWARD
+        # Retract (travel retraction)
+        reactor._monotonic = 10.05
+        simulate_e_move(enabled_buf, e_delta=-2.0, xyz_dist=0.0, speed=30.0)
+        # Advance time so control timer fires (0.25s interval)
+        reactor.advance_time(0.25)
+        assert enabled_buf.motor_direction == STOP
+
+    def test_infill_retraction_preserves_motor(self, enabled_buf, reactor):
+        """Extrude → retract → extrude within 0.05s → motor stays FORWARD."""
+        enabled_buf._print_stats.state = "printing"
+        set_sensors(enabled_buf, middle=True)
+        reactor._monotonic = 10.0
+        # Extrude
+        simulate_e_move(enabled_buf, e_delta=1.0, xyz_dist=10.0, speed=50.0)
+        assert enabled_buf.motor_direction == FORWARD
+        # Brief retract
+        reactor._monotonic = 10.02
+        simulate_e_move(enabled_buf, e_delta=-0.8, xyz_dist=0.0, speed=30.0)
+        # Quick resume extrusion (infill gap < 0.05s)
+        reactor._monotonic = 10.05
+        simulate_e_move(enabled_buf, e_delta=1.0, xyz_dist=10.0, speed=50.0)
+        # Fire deferred callbacks
+        reactor.flush_callbacks()
+        assert enabled_buf.motor_direction == FORWARD
+
+    def test_smoothed_velocity_returns_zero_during_retraction(
+            self, enabled_buf, reactor):
+        """_smoothed_velocity returns 0 when _extruder_retracting is True."""
+        reactor._monotonic = 10.0
+        enabled_buf._velocity_window = [(10.0, 5.0)]
+        enabled_buf._extruder_retracting = True
+        assert enabled_buf._smoothed_velocity(10.0) == 0.
+
+    def test_smoothed_velocity_resumes_after_deretract(
+            self, enabled_buf, reactor):
+        """After retract + forward extrusion, _smoothed_velocity returns
+        positive value from velocity window."""
+        enabled_buf._print_stats.state = "printing"
+        set_sensors(enabled_buf, middle=True)
+        reactor._monotonic = 10.0
+        # Extrude to populate window
+        simulate_e_move(enabled_buf, e_delta=1.0, xyz_dist=10.0, speed=50.0)
+        # Retract
+        reactor._monotonic = 10.05
+        simulate_e_move(enabled_buf, e_delta=-2.0, xyz_dist=0.0, speed=30.0)
+        assert enabled_buf._smoothed_velocity(10.05) == 0.
+        # De-retract / resume extrusion
+        reactor._monotonic = 10.10
+        simulate_e_move(enabled_buf, e_delta=1.0, xyz_dist=10.0, speed=50.0)
+        assert enabled_buf._extruder_retracting is False
+        assert enabled_buf._smoothed_velocity(10.10) > 0.
+
+    def test_retract_zhop_travel_deretract_sequence(
+            self, enabled_buf, reactor):
+        """Full retract → z-hop → travel → de-retract sequence: motor
+        stops during travel gap, resumes after de-retract."""
+        enabled_buf._print_stats.state = "printing"
+        set_sensors(enabled_buf, middle=True)
+        reactor._monotonic = 10.0
+        # T=0: Extrude (printing)
+        simulate_e_move(enabled_buf, e_delta=1.0, xyz_dist=10.0, speed=50.0)
+        assert enabled_buf.motor_direction == FORWARD
+        # T=0.02: Retract (G1 E-2)
+        reactor._monotonic = 10.02
+        simulate_e_move(enabled_buf, e_delta=-2.0, xyz_dist=0.0, speed=30.0)
+        assert enabled_buf._extruder_retracting is True
+        # T=0.05: Z-hop (no E movement, just Z) — no _on_e_movement call
+        # T=0.10: XY travel (no E movement) — no _on_e_movement call
+        # Advance time so timer fires during travel gap
+        reactor.advance_time(0.25)
+        assert enabled_buf.motor_direction == STOP
+        # De-retract after sufficient time for rate limit to expire
+        # (need > _min_drive_interval since last drive)
+        reactor._monotonic = 10.50
+        simulate_e_move(enabled_buf, e_delta=2.0, xyz_dist=0.0, speed=30.0)
+        assert enabled_buf._extruder_retracting is False
+        # Fire deferred callbacks and timers
+        reactor.flush_callbacks()
+        reactor._fire_timers()
+        # Resume extrusion after rate limit interval
+        reactor._monotonic = 10.65
+        simulate_e_move(enabled_buf, e_delta=1.0, xyz_dist=10.0, speed=50.0)
+        # Fire all pending callbacks and timers
+        reactor.flush_callbacks()
+        reactor._fire_timers()
+        assert enabled_buf.motor_direction == FORWARD
+
+    def test_velocity_window_preserved_during_retraction(
+            self, enabled_buf, reactor):
+        """Velocity window is NOT cleared during print retraction,
+        preserving speed data for matching when extrusion resumes."""
+        enabled_buf._print_stats.state = "printing"
+        set_sensors(enabled_buf, middle=True)
+        reactor._monotonic = 10.0
+        # Extrude to populate velocity window
+        simulate_e_move(enabled_buf, e_delta=1.0, xyz_dist=10.0, speed=50.0)
+        assert len(enabled_buf._velocity_window) > 0
+        # Retract
+        reactor._monotonic = 10.05
+        simulate_e_move(enabled_buf, e_delta=-2.0, xyz_dist=0.0, speed=30.0)
+        # Window should still have entries
+        assert len(enabled_buf._velocity_window) > 0

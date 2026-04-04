@@ -38,6 +38,8 @@ class MockReactor:
     """Controllable time source. Tests set _monotonic directly or via
     advance_time() which also fires due timers."""
 
+    NEVER = float('inf')
+
     def __init__(self):
         self._monotonic = 0.0
         self._timers = []  # [(callback, waketime)]
