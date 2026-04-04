@@ -286,6 +286,7 @@ class Buffer:
             orig = handlers.get(cmd)
             if orig:
                 setattr(self, '_orig_' + cmd, orig)
+                self.gcode.register_command(cmd, None)
                 self.gcode.register_command(cmd, self._cmd_move_wrapper)
         # Start control timer (watchdog for timeouts, bursts, decay)
         self._control_timer = self.reactor.register_timer(
