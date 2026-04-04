@@ -151,6 +151,8 @@ class Buffer:
             'slowdown_factor', 0.5, above=0., below=1.)
         self.full_zone_timeout = config.getfloat(
             'full_zone_timeout', 3.0, above=0.)
+        self.full_zone_retract_length = config.getfloat(
+            'full_zone_retract_length', 0., minval=0.)
         self.min_velocity = config.getfloat(
             'min_extrusion_velocity', 0.05, minval=0.)
         self.burst_feed_time = config.getfloat(
@@ -164,6 +166,8 @@ class Buffer:
             'control_interval', 0.25, above=0.05)
         self.velocity_factor = config.getfloat(
             'velocity_factor', 1.05, above=0.9, maxval=2.0)
+        self.manual_feed_full_timeout = config.getfloat(
+            'manual_feed_full_timeout', 5.0, above=0.)
 
         # Sensor pin names (resolved at ready time via buttons)
         self.sensor_empty_pin = config.get('sensor_empty_pin')
@@ -197,11 +201,13 @@ class Buffer:
         self._full_zone_feed_time = 0.
         self._last_full_feed_time = 0.
         self._in_full_zone = False
+        self._full_zone_retract_start = 0.
         self._extruder_retracting = False
         self._burst_delay_start = 0.
         self._burst_until = 0.
         self._burst_count = 0
         self._max_burst_cycles = 5
+        self._manual_feed_full_start = 0.
 
         # Print state tracking
         self._print_stats = None
@@ -387,6 +393,7 @@ class Buffer:
         self.state = STATE_DISABLED
         self.auto_enabled = False
         self._velocity_window = []
+        self._manual_feed_full_start = 0.
         logging.info("buffer: shutdown - motor stopped")
 
     def _update_extruder_velocity(self, eventtime):
@@ -461,13 +468,15 @@ class Buffer:
             if self.state == STATE_ERROR:
                 return
             self.state = STATE_MANUAL_FEED
+            self._manual_feed_full_start = 0.
             self.motor.set_velocity(FORWARD)
             self.motor_direction = FORWARD
         else:
             if self.state == STATE_MANUAL_FEED:
                 self._stop_motor()
-                self.state = STATE_IDLE if not self.auto_enabled \
-                    else STATE_STOPPED
+                self.auto_enabled = False
+                self.state = STATE_IDLE
+                self._velocity_window = []
 
     def _retract_button_callback(self, eventtime, state):
         self._retract_button_pressed = bool(state)
@@ -480,12 +489,31 @@ class Buffer:
         else:
             if self.state == STATE_MANUAL_RETRACT:
                 self._stop_motor()
-                self.state = STATE_IDLE if not self.auto_enabled \
-                    else STATE_STOPPED
+                self.auto_enabled = False
+                self.state = STATE_IDLE
+                self._velocity_window = []
 
     # --- Control logic ---
 
     def _control_timer_cb(self, eventtime):
+        # Auto-stop manual feed when full zone is sustained
+        if self.state == STATE_MANUAL_FEED:
+            if self.sensor_states['full']:
+                if self._manual_feed_full_start == 0.:
+                    self._manual_feed_full_start = eventtime
+                elif (eventtime - self._manual_feed_full_start
+                        >= self.manual_feed_full_timeout):
+                    self._stop_motor()
+                    self.state = STATE_IDLE
+                    self.auto_enabled = False
+                    self._manual_feed_full_start = 0.
+                    self.gcode.respond_info(
+                        "Buffer: manual feed stopped - full zone "
+                        "sustained for %.0fs"
+                        % self.manual_feed_full_timeout)
+            else:
+                self._manual_feed_full_start = 0.
+            return eventtime + self.control_interval
         if not self.auto_enabled:
             return eventtime + self.control_interval
         # Skip if in manual or error state
@@ -604,10 +632,30 @@ class Buffer:
                 self._in_full_zone = True
                 self._full_zone_feed_time = 0.
                 self._last_full_feed_time = 0.
+                self._full_zone_retract_start = 0.
             if self._full_zone_feed_time >= self.full_zone_timeout:
                 # Timeout exceeded - actively retract
-                new_direction = BACK
-                vactual_override = None  # Use configured speed_rpm
+                if (self.full_zone_retract_length > 0.
+                        and self._full_zone_retract_start > 0.):
+                    # Check if we've retracted long enough
+                    try:
+                        ms = self.motor.manual_stepper
+                        rd = ms.steppers[0].get_rotation_distance()[0]
+                    except Exception:
+                        rd = 23.2
+                    retract_speed = self.motor.speed_rpm * rd / 60.
+                    elapsed = eventtime - self._full_zone_retract_start
+                    if elapsed * retract_speed >= self.full_zone_retract_length:
+                        new_direction = STOP
+                        self._full_zone_retract_start = 0.
+                    else:
+                        new_direction = BACK
+                        vactual_override = None
+                else:
+                    new_direction = BACK
+                    vactual_override = None  # Use configured speed_rpm
+                    if self.full_zone_retract_length > 0.:
+                        self._full_zone_retract_start = eventtime
             elif self._smoothed_velocity(eventtime) > self.min_velocity:
                 # Still extruding - slow down feed proportionally
                 new_direction = FORWARD
@@ -778,11 +826,13 @@ class Buffer:
             'in_full_zone': self._in_full_zone,
             'full_zone_feed_time': round(self._full_zone_feed_time, 1),
             'full_zone_timeout': self.full_zone_timeout,
+            'full_zone_retract_length': self.full_zone_retract_length,
             'slowdown_factor': self.slowdown_factor,
             'burst_active': self._burst_until > 0.
                 and self.reactor.monotonic() < self._burst_until,
             'is_printing': self._is_printing(),
             'extruder_retracting': self._extruder_retracting,
+            'manual_feed_full_timeout': self.manual_feed_full_timeout,
         }
 
     # --- Gcode commands ---
@@ -833,6 +883,7 @@ class Buffer:
         self._burst_count = 0
         self._extruder_retracting = False
         self._velocity_window = []
+        self._manual_feed_full_start = 0.
         # Reset timing state
         self._last_ext_time = self.reactor.monotonic()
         self._last_e_command_time = 0.
@@ -850,6 +901,7 @@ class Buffer:
         self._burst_until = 0.
         self._burst_count = 0
         self._velocity_window = []
+        self._manual_feed_full_start = 0.
         gcmd.respond_info("Buffer: automatic control disabled")
 
     def cmd_BUFFER_FEED(self, gcmd):
@@ -858,6 +910,7 @@ class Buffer:
         self.motor.set_velocity(FORWARD, vactual)
         self.motor_direction = FORWARD
         self.state = STATE_MANUAL_FEED
+        self._manual_feed_full_start = 0.
         gcmd.respond_info("Buffer: feeding at %.0f RPM" % speed)
 
     def cmd_BUFFER_RETRACT(self, gcmd):
@@ -870,6 +923,7 @@ class Buffer:
 
     def cmd_BUFFER_STOP(self, gcmd):
         self._stop_motor()
+        self._manual_feed_full_start = 0.
         if self.auto_enabled:
             self.state = STATE_STOPPED
         else:
@@ -894,6 +948,7 @@ class Buffer:
             self._burst_until = 0.
             self._burst_count = 0
             self._velocity_window = []
+            self._manual_feed_full_start = 0.
             gcmd.respond_info("Buffer: error cleared")
         else:
             gcmd.respond_info("Buffer: no error to clear")
