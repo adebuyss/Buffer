@@ -161,7 +161,7 @@ class Buffer:
         self.follow_retract = config.getboolean('follow_retract', True)
         self.debug = config.getboolean('debug', False)
         self.control_interval = config.getfloat(
-            'control_interval', 0.5, above=0.)
+            'control_interval', 0.25, above=0.05)
 
         # Sensor pin names (resolved at ready time via buttons)
         self.sensor_empty_pin = config.get('sensor_empty_pin')
@@ -210,6 +210,12 @@ class Buffer:
         self._orig_G1 = None
         self._orig_G2 = None
         self._orig_G3 = None
+
+        # Deferred drive state
+        self._last_drive_time = 0.
+        self._min_drive_interval = config.getfloat(
+            'drive_interval', 0.1, above=0.02, maxval=1.0)
+        self._drive_pending = False
 
         # Timer handle
         self._control_timer = None
@@ -360,13 +366,12 @@ class Buffer:
             else:
                 self._extruder_retracting = True
                 self.extruder_velocity = 0.
-                if self.motor_direction == FORWARD:
-                    self._stop_motor()
-                    self.state = STATE_STOPPED
+                # Flag that motor should stop, but defer the write
+                self._request_drive_update(eventtime)
                 return  # Don't evaluate further during print retraction
 
-        # Drive motor immediately
-        self._evaluate_and_drive(eventtime)
+        # Schedule deferred drive (rate-limited)
+        self._request_drive_update(eventtime)
 
     def _handle_shutdown(self):
         self.motor.emergency_stop()
@@ -378,6 +383,20 @@ class Buffer:
         """Refresh extruder velocity estimate. No-op — velocity is already
         updated in real time via G-code move hooks (_on_e_movement)."""
         pass
+
+    def _request_drive_update(self, eventtime):
+        """Schedule a deferred motor write if the rate limit allows."""
+        if self._drive_pending:
+            return  # callback already queued, it will pick up latest state
+        if eventtime - self._last_drive_time >= self._min_drive_interval:
+            self._drive_pending = True
+            self.reactor.register_callback(self._deferred_drive)
+
+    def _deferred_drive(self, eventtime):
+        """Reactor callback: perform the actual UART writes."""
+        self._drive_pending = False
+        self._last_drive_time = eventtime
+        self._evaluate_and_drive(eventtime)
 
     # --- Sensor callbacks ---
 
@@ -476,8 +495,14 @@ class Buffer:
             self.extruder_velocity = 0.
             self._extruder_retracting = False
             self._evaluate_and_drive(eventtime)
+        # Catch any drive updates that were rate-limited in the hook
+        if (eventtime - self._last_drive_time >= self._min_drive_interval
+                and (self.motor_direction != STOP
+                     or self.extruder_velocity > self.min_velocity)):
+            self._evaluate_and_drive(eventtime)
+            self._last_drive_time = eventtime
         # Burst/full-zone timing still needs periodic evaluation
-        if (self.sensor_states['empty'] or self._in_full_zone
+        elif (self.sensor_states['empty'] or self._in_full_zone
                 or self._burst_until > 0.):
             self._evaluate_and_drive(eventtime)
         return eventtime + self.control_interval
