@@ -58,9 +58,39 @@ class TestRateLimiting:
         gm.last_position[3] += 0.5
         gm.last_position[0] += 10.0
         enabled_buf._on_e_movement(0.5, prev_pos)
-        # Should NOT have scheduled another callback
-        assert enabled_buf._drive_pending is False
+        # Rate-limited: schedules a timer instead of immediate callback
+        assert enabled_buf._drive_pending is True
+        # No new immediate callback — timer used instead
         assert len(reactor._pending_callbacks) == 0
+        # Drive timer was activated with correct wake time
+        _, wake = reactor._timers[enabled_buf._drive_timer]
+        assert wake != reactor.NEVER
+        assert wake == pytest.approx(
+            enabled_buf._last_drive_time + enabled_buf._min_drive_interval)
+
+    def test_rate_limited_moves_do_not_accumulate_timers(
+            self, enabled_buf, reactor):
+        """Repeated rate-limited moves must reuse a single timer,
+        not create new ones each time."""
+        set_sensors(enabled_buf, middle=True)
+        reactor._monotonic = 10.0
+        # First move — immediate callback path
+        simulate_e_move(enabled_buf, e_delta=0.5, xyz_dist=10.0, speed=50.0)
+        timer_count_baseline = len(reactor._timers)
+        # Fire 20 rate-limited cycles
+        for i in range(20):
+            # Advance past rate limit so timer fires and clears pending
+            reactor.advance_time(0.15)
+            # Next move within rate limit
+            reactor._monotonic += 0.02
+            gm = enabled_buf._gcode_move
+            prev_pos = list(gm.last_position)
+            gm.speed = 50.0
+            gm.last_position[3] += 0.1
+            gm.last_position[0] += 1.0
+            enabled_buf._on_e_movement(0.1, prev_pos)
+        # No new timers should have been created
+        assert len(reactor._timers) == timer_count_baseline
 
     def test_after_interval_new_callback_scheduled(self, enabled_buf, reactor):
         """After the rate limit interval passes, a new move should
@@ -125,10 +155,10 @@ class TestControlTimerCatchUp:
 
 
 class TestDeferredRetraction:
-    def test_retraction_during_print_preserves_velocity(
+    def test_retraction_during_print_zeroes_velocity(
             self, enabled_buf, reactor):
-        """Retraction during printing should preserve smoothed velocity
-        so motor keeps running through brief infill retractions."""
+        """Retraction during printing should zero velocity so motor
+        stops during travel retractions."""
         set_sensors(enabled_buf, middle=True)
         reactor._monotonic = 10.0
         enabled_buf._print_stats.state = "printing"
@@ -136,13 +166,12 @@ class TestDeferredRetraction:
         assert enabled_buf.motor_direction == FORWARD
         prev_velocity = enabled_buf.extruder_velocity
 
-        # Now retract — smoothed velocity should be preserved
+        # Now retract — velocity should be zeroed
         reactor._monotonic = 10.15
         simulate_e_move(enabled_buf, e_delta=-2.0, xyz_dist=0.0, speed=30.0)
         assert enabled_buf._extruder_retracting is True
-        # Smoothed velocity keeps the previous forward velocity
-        assert enabled_buf.extruder_velocity == pytest.approx(
-            prev_velocity, abs=0.1)
+        # Velocity zeroed during retraction to prevent stale forward drive
+        assert enabled_buf.extruder_velocity == 0.0
 
 
 class TestSensorCallbacksUnchanged:

@@ -85,7 +85,7 @@ class TestEMovementDetection:
         assert enabled_buf.extruder_velocity == prev_velocity
 
     def test_negative_e_delta_is_retraction(self, enabled_buf, reactor):
-        """Negative E delta while printing preserves smoothed velocity."""
+        """Negative E delta while printing sets velocity to zero."""
         set_sensors(enabled_buf, middle=True)
         reactor._monotonic = 10.0
         enabled_buf.motor_direction = FORWARD
@@ -99,9 +99,8 @@ class TestEMovementDetection:
         reactor._monotonic = 10.05
         simulate_e_move(enabled_buf, e_delta=-2.0, xyz_dist=0.0, speed=30.0)
         assert enabled_buf._extruder_retracting is True
-        # Smoothed velocity preserved, not zeroed
-        assert enabled_buf.extruder_velocity == pytest.approx(
-            prev_velocity, abs=0.1)
+        # Velocity zeroed during retraction to prevent stale forward drive
+        assert enabled_buf.extruder_velocity == 0.0
 
 
 class TestSmoothedVelocity:
@@ -137,22 +136,21 @@ class TestSmoothedVelocity:
         assert smoothed == pytest.approx(low_vel, abs=0.1)
         assert smoothed < high_vel
 
-    def test_retraction_preserves_smoothed_during_print(
+    def test_retraction_zeroes_smoothed_during_print(
             self, enabled_buf, reactor):
-        """During print retraction, smoothed velocity bridges the gap."""
+        """During print retraction, smoothed velocity returns 0."""
         set_sensors(enabled_buf, middle=True)
         enabled_buf._print_stats.state = "printing"
         reactor._monotonic = 10.0
         simulate_e_move(enabled_buf, e_delta=1.0, xyz_dist=10.0, speed=50.0)
-        forward_vel = enabled_buf.extruder_velocity
 
         # Brief retraction (< window duration)
         reactor._monotonic = 10.05
         simulate_e_move(enabled_buf, e_delta=-0.8, xyz_dist=0.0, speed=30.0)
 
-        # Smoothed velocity should still be the forward velocity
+        # Smoothed velocity returns 0 during active retraction
         smoothed = enabled_buf._smoothed_velocity(10.05)
-        assert smoothed == pytest.approx(forward_vel, abs=0.1)
+        assert smoothed == 0.
 
     def test_window_cleared_on_decay(self, enabled_buf, reactor):
         """Velocity decay should clear the window."""

@@ -230,8 +230,9 @@ class Buffer:
             'drive_interval', 0.1, above=0.02, maxval=1.0)
         self._drive_pending = False
 
-        # Timer handle
+        # Timer handles
         self._control_timer = None
+        self._drive_timer = None
 
         # Register events
         self.printer.register_event_handler(
@@ -310,6 +311,8 @@ class Buffer:
         # Start control timer (watchdog for timeouts, bursts, decay)
         self._control_timer = self.reactor.register_timer(
             self._control_timer_cb, self.reactor.monotonic() + 1.)
+        self._drive_timer = self.reactor.register_timer(
+            self._deferred_drive_timer, self.reactor.NEVER)
         logging.info("buffer: ready")
 
     def _is_printing(self):
@@ -379,9 +382,11 @@ class Buffer:
                 self._extruder_retracting = True
             else:
                 self._extruder_retracting = True
-                self.extruder_velocity = self._smoothed_velocity(eventtime)
-                # Defer drive update — smoothed velocity keeps motor running
-                # through brief infill retractions
+                self.extruder_velocity = 0.
+                # Don't clear velocity window — still useful for speed
+                # matching when forward extrusion resumes.
+                # Deferred callback will stop motor if no forward
+                # extrusion arrives (travel retraction).
                 self._request_drive_update(eventtime)
                 return  # Don't evaluate further during print retraction
 
@@ -403,7 +408,11 @@ class Buffer:
 
     def _smoothed_velocity(self, eventtime):
         """Return the max forward extrusion velocity seen in the recent window.
-        Bridges brief retraction gaps during infill direction changes."""
+        Bridges brief retraction gaps during infill direction changes.
+        Returns 0 during active retraction to prevent stale forward
+        velocity from driving the motor while extruder retracts."""
+        if self._extruder_retracting:
+            return 0.
         cutoff = eventtime - self._velocity_window_duration
         self._velocity_window = [
             (t, v) for t, v in self._velocity_window if t >= cutoff]
@@ -415,15 +424,26 @@ class Buffer:
         """Schedule a deferred motor write if the rate limit allows."""
         if self._drive_pending:
             return  # callback already queued, it will pick up latest state
-        if eventtime - self._last_drive_time >= self._min_drive_interval:
+        elapsed = eventtime - self._last_drive_time
+        if elapsed >= self._min_drive_interval:
             self._drive_pending = True
             self.reactor.register_callback(self._deferred_drive)
+        else:
+            # Rate-limited: schedule for when the interval expires
+            self._drive_pending = True
+            wake_time = self._last_drive_time + self._min_drive_interval
+            self.reactor.update_timer(self._drive_timer, wake_time)
 
     def _deferred_drive(self, eventtime):
         """Reactor callback: perform the actual UART writes."""
         self._drive_pending = False
         self._last_drive_time = eventtime
         self._evaluate_and_drive(eventtime)
+
+    def _deferred_drive_timer(self, eventtime):
+        """One-shot timer callback for rate-limited drive requests."""
+        self._deferred_drive(eventtime)
+        return self.reactor.NEVER
 
     # --- Sensor callbacks ---
 
