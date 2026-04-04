@@ -230,8 +230,9 @@ class Buffer:
             'drive_interval', 0.1, above=0.02, maxval=1.0)
         self._drive_pending = False
 
-        # Timer handle
+        # Timer handles
         self._control_timer = None
+        self._drive_timer = None
 
         # Register events
         self.printer.register_event_handler(
@@ -310,6 +311,8 @@ class Buffer:
         # Start control timer (watchdog for timeouts, bursts, decay)
         self._control_timer = self.reactor.register_timer(
             self._control_timer_cb, self.reactor.monotonic() + 1.)
+        self._drive_timer = self.reactor.register_timer(
+            self._deferred_drive_timer, self.reactor.NEVER)
         logging.info("buffer: ready")
 
     def _is_printing(self):
@@ -429,8 +432,7 @@ class Buffer:
             # Rate-limited: schedule for when the interval expires
             self._drive_pending = True
             wake_time = self._last_drive_time + self._min_drive_interval
-            self.reactor.register_timer(
-                self._deferred_drive_timer, wake_time)
+            self.reactor.update_timer(self._drive_timer, wake_time)
 
     def _deferred_drive(self, eventtime):
         """Reactor callback: perform the actual UART writes."""

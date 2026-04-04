@@ -62,6 +62,35 @@ class TestRateLimiting:
         assert enabled_buf._drive_pending is True
         # No new immediate callback — timer used instead
         assert len(reactor._pending_callbacks) == 0
+        # Drive timer was activated with correct wake time
+        _, wake = reactor._timers[enabled_buf._drive_timer]
+        assert wake != reactor.NEVER
+        assert wake == pytest.approx(
+            enabled_buf._last_drive_time + enabled_buf._min_drive_interval)
+
+    def test_rate_limited_moves_do_not_accumulate_timers(
+            self, enabled_buf, reactor):
+        """Repeated rate-limited moves must reuse a single timer,
+        not create new ones each time."""
+        set_sensors(enabled_buf, middle=True)
+        reactor._monotonic = 10.0
+        # First move — immediate callback path
+        simulate_e_move(enabled_buf, e_delta=0.5, xyz_dist=10.0, speed=50.0)
+        timer_count_baseline = len(reactor._timers)
+        # Fire 20 rate-limited cycles
+        for i in range(20):
+            # Advance past rate limit so timer fires and clears pending
+            reactor.advance_time(0.15)
+            # Next move within rate limit
+            reactor._monotonic += 0.02
+            gm = enabled_buf._gcode_move
+            prev_pos = list(gm.last_position)
+            gm.speed = 50.0
+            gm.last_position[3] += 0.1
+            gm.last_position[0] += 1.0
+            enabled_buf._on_e_movement(0.1, prev_pos)
+        # No new timers should have been created
+        assert len(reactor._timers) == timer_count_baseline
 
     def test_after_interval_new_callback_scheduled(self, enabled_buf, reactor):
         """After the rate limit interval passes, a new move should

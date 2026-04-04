@@ -81,6 +81,10 @@ class MockReactor:
         self._timers.append((callback, waketime))
         return handle
 
+    def update_timer(self, handle, waketime):
+        cb, _ = self._timers[handle]
+        self._timers[handle] = (cb, waketime)
+
 
 class MockGcode:
     def __init__(self):
