@@ -373,9 +373,13 @@ class Buffer:
 
         # Update buffer state
         if e_delta > 0.:
-            self.extruder_velocity = e_velocity
             self._extruder_retracting = False
-            self._velocity_window.append((eventtime, e_velocity))
+            if xyz_dist > 0.001:
+                # Real extrusion (mixed XYZ+E): update velocity and window
+                self.extruder_velocity = e_velocity
+                self._velocity_window.append((eventtime, e_velocity))
+            # else: De-retract (pure E forward) — don't update velocity
+            # or window; retract speed would cause velocity spikes
         else:
             if self.follow_retract and not self._is_printing():
                 self.extruder_velocity = e_velocity
