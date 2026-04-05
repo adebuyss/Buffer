@@ -17,16 +17,14 @@ class TestEVelocityComputation:
         assert enabled_buf.extruder_velocity == pytest.approx(5.0, abs=0.1)
 
     def test_pure_e_move(self, enabled_buf, reactor):
-        """Pure forward E move (de-retract/load) should NOT update
-        extruder_velocity or velocity window — retract speed would
-        cause velocity spikes."""
+        """Pure forward E move outside printing (load/purge) should
+        update extruder_velocity normally."""
         set_sensors(enabled_buf, middle=True)
         reactor._monotonic = 10.0
-        # Pure E move: no XYZ movement (e.g., de-retract at 25mm/s)
+        # Not printing — pure E move should update velocity
+        enabled_buf._print_stats.state = "standby"
         simulate_e_move(enabled_buf, e_delta=5.0, xyz_dist=0.0, speed=25.0)
-        # Velocity not updated — pure E forward moves are filtered
-        assert enabled_buf.extruder_velocity == 0.0
-        assert len(enabled_buf._velocity_window) == 0
+        assert enabled_buf.extruder_velocity == pytest.approx(25.0, abs=0.1)
 
     def test_expected_move_end_computed(self, enabled_buf, reactor):
         set_sensors(enabled_buf, middle=True)
