@@ -17,10 +17,12 @@ class TestEVelocityComputation:
         assert enabled_buf.extruder_velocity == pytest.approx(5.0, abs=0.1)
 
     def test_pure_e_move(self, enabled_buf, reactor):
-        """Pure E move (retraction/load): e_velocity = speed."""
+        """Pure forward E move outside printing (load/purge) should
+        update extruder_velocity normally."""
         set_sensors(enabled_buf, middle=True)
         reactor._monotonic = 10.0
-        # Pure E move: no XYZ movement
+        # Not printing — pure E move should update velocity
+        enabled_buf._print_stats.state = "standby"
         simulate_e_move(enabled_buf, e_delta=5.0, xyz_dist=0.0, speed=25.0)
         assert enabled_buf.extruder_velocity == pytest.approx(25.0, abs=0.1)
 

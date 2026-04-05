@@ -62,8 +62,8 @@ class TestRetractionFollowing:
         simulate_e_move(enabled_buf, e_delta=-5.0, xyz_dist=0.0, speed=30.0)
         assert enabled_buf._extruder_retracting is True
 
-        # Forward extrusion
-        simulate_e_move(enabled_buf, e_delta=5.0, xyz_dist=0.0, speed=30.0)
+        # Forward extrusion (with XY movement = real extrusion)
+        simulate_e_move(enabled_buf, e_delta=5.0, xyz_dist=10.0, speed=30.0)
         assert enabled_buf._extruder_retracting is False
         assert enabled_buf.extruder_velocity > 0
 
@@ -181,3 +181,61 @@ class TestRetractionZhop:
         simulate_e_move(enabled_buf, e_delta=-2.0, xyz_dist=0.0, speed=30.0)
         # Window should still have entries
         assert len(enabled_buf._velocity_window) > 0
+
+
+class TestDeretractFiltering:
+    """Tests that de-retract (pure E forward) doesn't pollute velocity."""
+
+    def test_deretract_does_not_pollute_velocity_window(
+            self, enabled_buf, reactor):
+        """De-retract (pure E+) should NOT add entry to window."""
+        enabled_buf._print_stats.state = "printing"
+        set_sensors(enabled_buf, middle=True)
+        reactor._monotonic = 10.0
+        # Extrude to populate window
+        simulate_e_move(enabled_buf, e_delta=1.0, xyz_dist=10.0, speed=50.0)
+        window_len = len(enabled_buf._velocity_window)
+        # Retract
+        reactor._monotonic = 10.05
+        simulate_e_move(enabled_buf, e_delta=-2.0, xyz_dist=0.0, speed=30.0)
+        # De-retract (pure E at retract speed — should NOT add to window)
+        reactor._monotonic = 10.30
+        simulate_e_move(enabled_buf, e_delta=2.0, xyz_dist=0.0, speed=40.0)
+        assert len(enabled_buf._velocity_window) == window_len
+
+    def test_deretract_clears_retracting_flag(self, enabled_buf, reactor):
+        """De-retract should clear _extruder_retracting even without
+        updating velocity."""
+        enabled_buf._print_stats.state = "printing"
+        set_sensors(enabled_buf, middle=True)
+        reactor._monotonic = 10.0
+        simulate_e_move(enabled_buf, e_delta=1.0, xyz_dist=10.0, speed=50.0)
+        # Retract
+        reactor._monotonic = 10.05
+        simulate_e_move(enabled_buf, e_delta=-2.0, xyz_dist=0.0, speed=30.0)
+        assert enabled_buf._extruder_retracting is True
+        # De-retract (pure E forward)
+        reactor._monotonic = 10.30
+        simulate_e_move(enabled_buf, e_delta=2.0, xyz_dist=0.0, speed=40.0)
+        assert enabled_buf._extruder_retracting is False
+
+    def test_smoothed_velocity_after_deretract_uses_window(
+            self, enabled_buf, reactor):
+        """After de-retract, _smoothed_velocity should return old window
+        values, not retract speed."""
+        enabled_buf._print_stats.state = "printing"
+        set_sensors(enabled_buf, middle=True)
+        reactor._monotonic = 10.0
+        # Extrude at 5 mm/s
+        simulate_e_move(enabled_buf, e_delta=1.0, xyz_dist=10.0, speed=50.0)
+        extrude_vel = enabled_buf.extruder_velocity
+        # Retract
+        reactor._monotonic = 10.05
+        simulate_e_move(enabled_buf, e_delta=-2.0, xyz_dist=0.0, speed=30.0)
+        # De-retract at 40 mm/s (should not pollute window)
+        reactor._monotonic = 10.15
+        simulate_e_move(enabled_buf, e_delta=2.0, xyz_dist=0.0, speed=40.0)
+        smoothed = enabled_buf._smoothed_velocity(10.15)
+        # Should return old extrusion velocity (~5), not retract speed (40)
+        assert smoothed < 10.0
+        assert smoothed > 0.
