@@ -4,6 +4,7 @@ from conftest import (
     FORWARD, BACK, STOP,
     STATE_STOPPED, STATE_FEEDING, STATE_RETRACTING, STATE_ERROR,
     STATE_MANUAL_FEED, STATE_DISABLED,
+    ZONE_FULL,
     set_sensors, simulate_e_move,
 )
 
@@ -25,12 +26,12 @@ class TestMiddleZone:
 
     def test_resets_burst_and_full_zone_state(self, enabled_buf, reactor):
         enabled_buf._burst_count = 3
-        enabled_buf._in_full_zone = True
+        enabled_buf._current_zone = ZONE_FULL
         set_sensors(enabled_buf, middle=True)
         reactor._monotonic = 10.0
         enabled_buf._evaluate_and_drive(10.0)
         assert enabled_buf._burst_count == 0
-        assert enabled_buf._in_full_zone is False
+        assert enabled_buf._current_zone != ZONE_FULL
 
 
 class TestEmptyZone:
@@ -57,7 +58,7 @@ class TestFullZone:
         reactor._monotonic = 10.0
         simulate_e_move(enabled_buf, 1.0, xyz_dist=10.0, speed=50.0)
         assert enabled_buf.motor_direction == FORWARD
-        assert enabled_buf._in_full_zone is True
+        assert enabled_buf._current_zone == ZONE_FULL
 
     def test_idle_stops(self, enabled_buf, reactor):
         set_sensors(enabled_buf, full=True)
@@ -73,7 +74,7 @@ class TestFullMiddleOverlap:
         reactor._monotonic = 10.0
         simulate_e_move(enabled_buf, 1.0, xyz_dist=10.0, speed=50.0)
         assert enabled_buf.motor_direction == FORWARD
-        assert enabled_buf._in_full_zone is False
+        assert enabled_buf._current_zone != ZONE_FULL
         assert enabled_buf._full_zone_feed_time == 0.0
 
     def test_idle_stops(self, enabled_buf, reactor):
@@ -98,6 +99,7 @@ class TestNoSensors:
     def test_was_retracting_continues_back(self, enabled_buf, reactor):
         enabled_buf.motor_direction = BACK
         enabled_buf.motor.current_direction = BACK
+        enabled_buf._current_zone = ZONE_FULL
         set_sensors(enabled_buf)
         reactor._monotonic = 10.0
         enabled_buf.extruder_velocity = 0.0
@@ -183,15 +185,15 @@ class TestZoneTransitions:
         # Full zone (deep)
         set_sensors(enabled_buf, full=True)
         enabled_buf._evaluate_and_drive(10.5)
-        assert enabled_buf._in_full_zone is True
+        assert enabled_buf._current_zone == ZONE_FULL
 
         # Full+middle overlap
         set_sensors(enabled_buf, full=True, middle=True)
         enabled_buf._evaluate_and_drive(11.0)
-        assert enabled_buf._in_full_zone is False
+        assert enabled_buf._current_zone != ZONE_FULL
 
         # Back to middle
         set_sensors(enabled_buf, middle=True)
         enabled_buf._evaluate_and_drive(11.5)
-        assert enabled_buf._in_full_zone is False
+        assert enabled_buf._current_zone != ZONE_FULL
         assert enabled_buf._full_zone_feed_time == 0.0

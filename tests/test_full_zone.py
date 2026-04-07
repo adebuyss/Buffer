@@ -3,6 +3,7 @@ import pytest
 from conftest import (
     FORWARD, BACK, STOP,
     STATE_FEEDING, STATE_RETRACTING,
+    ZONE_FULL,
     set_sensors, simulate_e_move,
 )
 
@@ -13,7 +14,7 @@ class TestFullZoneEntry:
         reactor._monotonic = 10.0
         enabled_buf.extruder_velocity = 5.0
         enabled_buf._evaluate_and_drive(10.0)
-        assert enabled_buf._in_full_zone is True
+        assert enabled_buf._current_zone == ZONE_FULL
         assert enabled_buf._full_zone_feed_time == 0.0
 
     def test_reentry_resets_timer(self, enabled_buf, reactor):
@@ -27,13 +28,13 @@ class TestFullZoneEntry:
         # Leave to middle
         set_sensors(enabled_buf, middle=True)
         enabled_buf._evaluate_and_drive(12.0)
-        assert enabled_buf._in_full_zone is False
+        assert enabled_buf._current_zone != ZONE_FULL
         assert enabled_buf._full_zone_feed_time == 0.0
 
         # Re-enter full zone
         set_sensors(enabled_buf, full=True)
         enabled_buf._evaluate_and_drive(13.0)
-        assert enabled_buf._in_full_zone is True
+        assert enabled_buf._current_zone == ZONE_FULL
         assert enabled_buf._full_zone_feed_time == 0.0
 
 
@@ -46,7 +47,7 @@ class TestFullZoneFeedTimeAccumulation:
 
         # First call: enters full zone, sets _last_full_feed_time
         enabled_buf._evaluate_and_drive(t)
-        assert enabled_buf._in_full_zone is True
+        assert enabled_buf._current_zone == ZONE_FULL
 
         # Second call 1s later: accumulates feed time
         t += 1.0
@@ -154,10 +155,10 @@ class TestFullZoneLeaving:
         reactor._monotonic = 10.0
         enabled_buf.extruder_velocity = 5.0
         enabled_buf._evaluate_and_drive(10.0)
-        assert enabled_buf._in_full_zone is True
+        assert enabled_buf._current_zone == ZONE_FULL
 
         # Transition to overlap
         set_sensors(enabled_buf, full=True, middle=True)
         enabled_buf._evaluate_and_drive(11.0)
-        assert enabled_buf._in_full_zone is False
+        assert enabled_buf._current_zone != ZONE_FULL
         assert enabled_buf._full_zone_feed_time == 0.0

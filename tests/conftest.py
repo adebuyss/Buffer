@@ -22,6 +22,11 @@ STATE_RETRACTING = buffer_module.STATE_RETRACTING
 STATE_ERROR = buffer_module.STATE_ERROR
 STATE_MANUAL_FEED = buffer_module.STATE_MANUAL_FEED
 STATE_MANUAL_RETRACT = buffer_module.STATE_MANUAL_RETRACT
+ZONE_EMPTY = buffer_module.ZONE_EMPTY
+ZONE_FULL = buffer_module.ZONE_FULL
+ZONE_FULL_MIDDLE = buffer_module.ZONE_FULL_MIDDLE
+ZONE_MIDDLE = buffer_module.ZONE_MIDDLE
+ZONE_NONE = buffer_module.ZONE_NONE
 
 
 # ---------------------------------------------------------------------------
