@@ -4,6 +4,7 @@ from conftest import (
     FORWARD, BACK, STOP,
     STATE_DISABLED, STATE_IDLE, STATE_STOPPED, STATE_ERROR,
     STATE_MANUAL_FEED, STATE_MANUAL_RETRACT,
+    ZONE_FULL,
     MockGcmd,
 )
 
@@ -35,13 +36,13 @@ class TestBufferEnable:
         assert buf.error_msg == ''
 
     def test_resets_state(self, buf):
-        buf._in_full_zone = True
+        buf._current_zone = ZONE_FULL
         buf._full_zone_feed_time = 5.0
         buf._burst_count = 3
         buf._extruder_retracting = True
         gcmd = MockGcmd('BUFFER_ENABLE')
         buf.cmd_BUFFER_ENABLE(gcmd)
-        assert buf._in_full_zone is False
+        assert buf._current_zone != ZONE_FULL
         assert buf._full_zone_feed_time == 0.0
         assert buf._burst_count == 0
         assert buf._extruder_retracting is False
@@ -56,11 +57,11 @@ class TestBufferDisable:
         assert enabled_buf.motor_direction == STOP
 
     def test_resets_zone_state(self, enabled_buf):
-        enabled_buf._in_full_zone = True
+        enabled_buf._current_zone = ZONE_FULL
         enabled_buf._burst_count = 3
         gcmd = MockGcmd('BUFFER_DISABLE')
         enabled_buf.cmd_BUFFER_DISABLE(gcmd)
-        assert enabled_buf._in_full_zone is False
+        assert enabled_buf._current_zone != ZONE_FULL
         assert enabled_buf._burst_count == 0
 
 
@@ -117,13 +118,13 @@ class TestBufferClearError:
     def test_clears_error(self, enabled_buf):
         enabled_buf.state = STATE_ERROR
         enabled_buf.error_msg = "test"
-        enabled_buf._in_full_zone = True
+        enabled_buf._current_zone = ZONE_FULL
         enabled_buf._burst_count = 5
         gcmd = MockGcmd('BUFFER_CLEAR_ERROR')
         enabled_buf.cmd_BUFFER_CLEAR_ERROR(gcmd)
         assert enabled_buf.state == STATE_STOPPED
         assert enabled_buf.error_msg == ''
-        assert enabled_buf._in_full_zone is False
+        assert enabled_buf._current_zone != ZONE_FULL
         assert enabled_buf._burst_count == 0
 
     def test_clear_when_no_error(self, buf):

@@ -23,6 +23,42 @@ STATE_ERROR = 'error'
 STATE_MANUAL_FEED = 'manual_feed'
 STATE_MANUAL_RETRACT = 'manual_retract'
 
+# Sensor zone identifiers for transition tracking
+ZONE_EMPTY = 'empty'
+ZONE_FULL = 'full'
+ZONE_FULL_MIDDLE = 'full_middle'
+ZONE_MIDDLE = 'middle'
+ZONE_NONE = 'none'
+
+# State machine transitions:
+#   DISABLED -> IDLE          on klippy:ready
+#   IDLE -> STOPPED           on material insert (auto-enable) or BUFFER_ENABLE
+#   IDLE -> DISABLED          on BUFFER_DISABLE
+#   STOPPED -> FEEDING        on _set_motor(FORWARD)
+#   STOPPED -> RETRACTING     on _set_motor(BACK)
+#   FEEDING -> STOPPED        on _set_motor(STOP)
+#   FEEDING -> RETRACTING     on _set_motor(BACK)
+#   RETRACTING -> STOPPED     on _set_motor(STOP)
+#   RETRACTING -> FEEDING     on _set_motor(FORWARD)
+#   * -> ERROR                on _handle_error (sensor conflict, fwd timeout,
+#                             burst exhaustion)
+#   ERROR -> STOPPED/IDLE     on BUFFER_CLEAR_ERROR
+#   * -> MANUAL_FEED          on feed button press / BUFFER_FEED
+#   * -> MANUAL_RETRACT       on retract button press / BUFFER_RETRACT
+#   MANUAL_* -> IDLE          on button release (auto_enabled cleared)
+#   FEEDING/STOPPED/RETRACTING -> IDLE  on filament runout
+#   * -> DISABLED             on BUFFER_DISABLE / klippy:shutdown
+#
+# Invariants:
+# - ERROR blocks all gcode feed/retract; only BUFFER_CLEAR_ERROR exits.
+# - MANUAL_FEED/MANUAL_RETRACT block automatic zone evaluation.
+# - DISABLED blocks material-insert auto-enable; only BUFFER_ENABLE exits.
+# - _set_motor is the canonical auto-control state mutation path
+#   (it sets motor_direction and FEEDING/RETRACTING/STOPPED state).
+# - _stop_motor halts the motor without changing self.state.
+# - cmd_BUFFER_FEED/RETRACT bypass _set_motor; they set motor_direction
+#   and MANUAL_* state directly. forward_timeout does not apply.
+
 # TMC2208/2225 register addresses
 REG_GCONF = 0x00
 REG_VACTUAL = 0x22
@@ -200,7 +236,8 @@ class Buffer:
         self._retract_button_pressed = False
         self._full_zone_feed_time = 0.
         self._last_full_feed_time = 0.
-        self._in_full_zone = False
+        self._current_zone = None
+        self._prev_zone = None
         self._full_zone_retract_start = 0.
         self._extruder_retracting = False
         self._burst_delay_start = 0.
@@ -269,6 +306,30 @@ class Buffer:
         # Register sensor pins via buttons module
         self._register_sensors(config)
 
+    def _reset_control_state(self):
+        """Reset all zone, burst, velocity, and timing state."""
+        self._current_zone = None
+        self._prev_zone = None
+        self._full_zone_feed_time = 0.
+        self._last_full_feed_time = 0.
+        self._full_zone_retract_start = 0.
+        self._burst_delay_start = 0.
+        self._burst_until = 0.
+        self._burst_count = 0
+        self._velocity_window = []
+        self._manual_feed_full_start = 0.
+
+    def _reset_burst_state(self):
+        """Reset burst cycle counters."""
+        self._burst_delay_start = 0.
+        self._burst_until = 0.
+        self._burst_count = 0
+
+    def _reset_full_zone_state(self):
+        """Reset full zone tracking."""
+        self._full_zone_feed_time = 0.
+        self._last_full_feed_time = 0.
+
     def _register_sensors(self, config):
         buttons = self.printer.load_object(config, 'buttons')
         # Hall sensors
@@ -293,6 +354,9 @@ class Buffer:
     def _handle_ready(self):
         self.motor.handle_ready()
         self._last_ext_time = self.reactor.monotonic()
+        # Transition from initial DISABLED to IDLE — system is ready
+        # but waiting for filament or BUFFER_ENABLE.
+        self.state = STATE_IDLE
         # Look up print_stats for printing vs idle detection
         try:
             self._print_stats = self.printer.lookup_object('print_stats')
@@ -472,6 +536,10 @@ class Buffer:
             if self.pause_on_runout:
                 self._trigger_pause("buffer: filament runout detected")
         elif self.material_present and not was_present:
+            if self.state == STATE_DISABLED:
+                logging.info("buffer: filament detected but buffer is "
+                             "disabled; use BUFFER_ENABLE to activate")
+                return
             # Filament inserted - auto-enable and start initial fill
             self.auto_enabled = True
             self.state = STATE_STOPPED
@@ -570,10 +638,127 @@ class Buffer:
             self._evaluate_and_drive(eventtime)
             self._last_drive_time = eventtime
         # Burst/full-zone timing still needs periodic evaluation
-        elif (self.sensor_states['empty'] or self._in_full_zone
+        elif (self.sensor_states['empty']
+                or self._current_zone == ZONE_FULL
                 or self._burst_until > 0.):
             self._evaluate_and_drive(eventtime)
         return eventtime + self.control_interval
+
+    # --- Zone handlers ---
+
+    def _handle_retract_follow(self, eventtime):
+        if self.extruder_velocity > self.min_velocity:
+            vactual = self._velocity_to_vactual(
+                self.extruder_velocity * self.correction_factor)
+            if self.motor_direction != BACK:
+                self._set_motor(BACK, vactual)
+            elif vactual != self.motor._last_vactual:
+                self.motor.set_velocity(BACK, vactual)
+        else:
+            if self.motor_direction != STOP:
+                self._stop_motor()
+                self.state = STATE_STOPPED
+
+    def _zone_empty(self, eventtime, entered):
+        if entered:
+            self._reset_full_zone_state()
+        if self._smoothed_velocity(eventtime) > self.min_velocity:
+            self._reset_burst_state()
+            return FORWARD, None
+        if self._burst_count >= self._max_burst_cycles:
+            self._handle_error(
+                "Buffer stuck in empty zone after %d burst cycles"
+                % self._burst_count)
+            return None, None
+        if self._burst_until > 0. and eventtime < self._burst_until:
+            return FORWARD, None
+        if self._burst_delay_start > 0.:
+            if eventtime - self._burst_delay_start >= self.burst_delay:
+                self._burst_until = eventtime + self.burst_feed_time
+                self._burst_delay_start = 0.
+                self._burst_count += 1
+                return FORWARD, None
+            return STOP, None
+        self._burst_delay_start = eventtime
+        return STOP, None
+
+    def _zone_full_only(self, eventtime, entered):
+        if entered:
+            self._reset_burst_state()
+            self._full_zone_feed_time = 0.
+            self._last_full_feed_time = 0.
+            self._full_zone_retract_start = 0.
+        if self._full_zone_feed_time >= self.full_zone_timeout:
+            return self._full_zone_retract(eventtime)
+        if self._smoothed_velocity(eventtime) > self.min_velocity:
+            vactual = self._velocity_to_vactual(
+                self._smoothed_velocity(eventtime) * self.slowdown_factor)
+            if self._last_full_feed_time > 0.:
+                self._full_zone_feed_time += \
+                    eventtime - self._last_full_feed_time
+            self._last_full_feed_time = eventtime
+            return FORWARD, vactual
+        self._last_full_feed_time = 0.
+        return STOP, None
+
+    def _full_zone_retract(self, eventtime):
+        if (self.full_zone_retract_length > 0.
+                and self._full_zone_retract_start > 0.):
+            try:
+                ms = self.motor.manual_stepper
+                rd = ms.steppers[0].get_rotation_distance()[0]
+            except Exception:
+                rd = 23.2
+            retract_speed = self.motor.speed_rpm * rd / 60.
+            elapsed = eventtime - self._full_zone_retract_start
+            if elapsed * retract_speed >= self.full_zone_retract_length:
+                self._full_zone_retract_start = 0.
+                return STOP, None
+            return BACK, None
+        if self.full_zone_retract_length > 0.:
+            self._full_zone_retract_start = eventtime
+        return BACK, None
+
+    def _zone_full_middle(self, eventtime, entered):
+        if entered:
+            self._reset_full_zone_state()
+            self._reset_burst_state()
+        if self._smoothed_velocity(eventtime) > self.min_velocity:
+            vactual = self._velocity_to_vactual(
+                self._smoothed_velocity(eventtime) * self.slowdown_factor)
+            return FORWARD, vactual
+        return STOP, None
+
+    def _zone_middle(self, eventtime, entered):
+        if entered:
+            self._reset_full_zone_state()
+            self._reset_burst_state()
+        if self._smoothed_velocity(eventtime) > self.min_velocity:
+            vactual = self._velocity_to_vactual(
+                self._smoothed_velocity(eventtime) * self.velocity_factor)
+            return FORWARD, vactual
+        return STOP, None
+
+    def _zone_no_sensors(self, eventtime, entered):
+        if entered:
+            self._full_zone_feed_time = 0.
+        if self._burst_until > 0. and eventtime < self._burst_until:
+            return FORWARD, None
+        if entered:
+            self._reset_burst_state()
+        smoothed = self._smoothed_velocity(eventtime)
+        if (self._prev_zone in (ZONE_EMPTY, ZONE_MIDDLE, ZONE_NONE)
+                and smoothed > self.min_velocity):
+            vactual = self._velocity_to_vactual(
+                smoothed * self.correction_factor)
+            return FORWARD, vactual
+        if self._prev_zone == ZONE_FULL:
+            return BACK, None
+        if smoothed > self.min_velocity:
+            vactual = self._velocity_to_vactual(
+                smoothed * self.velocity_factor)
+            return FORWARD, vactual
+        return STOP, None
 
     def _evaluate_and_drive(self, eventtime):
         if not self.auto_enabled or not self.material_present:
@@ -585,17 +770,7 @@ class Buffer:
         # When not printing and extruder is retracting, follow retraction
         if (self._extruder_retracting and self.follow_retract
                 and not self._is_printing()):
-            if self.extruder_velocity > self.min_velocity:
-                vactual = self._velocity_to_vactual(
-                    self.extruder_velocity * self.correction_factor)
-                if self.motor_direction != BACK:
-                    self._set_motor(BACK, vactual)
-                elif vactual != self.motor._last_vactual:
-                    self.motor.set_velocity(BACK, vactual)
-            else:
-                if self.motor_direction != STOP:
-                    self._stop_motor()
-                    self.state = STATE_STOPPED
+            self._handle_retract_follow(eventtime)
             return
 
         empty = self.sensor_states['empty']
@@ -608,148 +783,43 @@ class Buffer:
                                "triggered")
             return
 
-        # Compute target velocity
-        vactual_override = None
-        new_direction = STOP
-
-        # Priority: empty > full-only > full+middle overlap > middle > no sensors
-        # Overlap zones (two adjacent sensors triggered) are normal during
-        # carriage travel and get transitional behavior.
-
+        # Identify zone
         if empty:
-            # Buffer near empty — full speed feed / burst
-            self._in_full_zone = False
-            self._full_zone_feed_time = 0.
-            if self._smoothed_velocity(eventtime) > self.min_velocity:
-                # Extruder active - catch up at full speed
-                new_direction = FORWARD
-                self._burst_delay_start = 0.
-                self._burst_until = 0.
-                self._burst_count = 0
-            elif self._burst_count >= self._max_burst_cycles:
-                # Too many bursts without leaving empty zone
-                self._handle_error(
-                    "Buffer stuck in empty zone after %d burst cycles"
-                    % self._burst_count)
-                return
-            elif self._burst_until > 0. and eventtime < self._burst_until:
-                # Active burst in progress
-                new_direction = FORWARD
-            elif self._burst_delay_start > 0.:
-                # Waiting for burst delay
-                if eventtime - self._burst_delay_start >= self.burst_delay:
-                    self._burst_until = eventtime + self.burst_feed_time
-                    self._burst_delay_start = 0.
-                    self._burst_count += 1
-                    new_direction = FORWARD
-                else:
-                    new_direction = STOP
-            else:
-                # First time empty while stopped - start delay
-                self._burst_delay_start = eventtime
-                new_direction = STOP
+            zone = ZONE_EMPTY
         elif full and not middle:
-            # Deep full zone — slow down, timeout, then retract
-            self._burst_delay_start = 0.
-            self._burst_until = 0.
-            self._burst_count = 0
-            if not self._in_full_zone:
-                self._in_full_zone = True
-                self._full_zone_feed_time = 0.
-                self._last_full_feed_time = 0.
-                self._full_zone_retract_start = 0.
-            if self._full_zone_feed_time >= self.full_zone_timeout:
-                # Timeout exceeded - actively retract
-                if (self.full_zone_retract_length > 0.
-                        and self._full_zone_retract_start > 0.):
-                    # Check if we've retracted long enough
-                    try:
-                        ms = self.motor.manual_stepper
-                        rd = ms.steppers[0].get_rotation_distance()[0]
-                    except Exception:
-                        rd = 23.2
-                    retract_speed = self.motor.speed_rpm * rd / 60.
-                    elapsed = eventtime - self._full_zone_retract_start
-                    if elapsed * retract_speed >= self.full_zone_retract_length:
-                        new_direction = STOP
-                        self._full_zone_retract_start = 0.
-                    else:
-                        new_direction = BACK
-                        vactual_override = None
-                else:
-                    new_direction = BACK
-                    vactual_override = None  # Use configured speed_rpm
-                    if self.full_zone_retract_length > 0.:
-                        self._full_zone_retract_start = eventtime
-            elif self._smoothed_velocity(eventtime) > self.min_velocity:
-                # Still extruding - slow down feed proportionally
-                new_direction = FORWARD
-                vactual_override = self._velocity_to_vactual(
-                    self._smoothed_velocity(eventtime) * self.slowdown_factor)
-                # Accumulate actual feeding time (not fixed increment)
-                if self._last_full_feed_time > 0.:
-                    self._full_zone_feed_time += \
-                        eventtime - self._last_full_feed_time
-                self._last_full_feed_time = eventtime
-            else:
-                # Not extruding and in full zone - just stop
-                self._last_full_feed_time = 0.
-                new_direction = STOP
+            zone = ZONE_FULL
         elif full and middle:
-            # Overlap transition zone — slow down but no timeout/retract
-            self._in_full_zone = False
-            self._full_zone_feed_time = 0.
-            self._burst_delay_start = 0.
-            self._burst_until = 0.
-            self._burst_count = 0
-            if self._smoothed_velocity(eventtime) > self.min_velocity:
-                new_direction = FORWARD
-                vactual_override = self._velocity_to_vactual(
-                    self._smoothed_velocity(eventtime) * self.slowdown_factor)
-            else:
-                new_direction = STOP
+            zone = ZONE_FULL_MIDDLE
         elif middle:
-            # In the ideal zone - match extruder velocity
-            self._in_full_zone = False
-            self._full_zone_feed_time = 0.
-            self._burst_delay_start = 0.
-            self._burst_until = 0.
-            self._burst_count = 0
-            if self._smoothed_velocity(eventtime) > self.min_velocity:
-                new_direction = FORWARD
-                vactual_override = self._velocity_to_vactual(
-                    self._smoothed_velocity(eventtime) * self.velocity_factor)
-            else:
-                new_direction = STOP
+            zone = ZONE_MIDDLE
         else:
-            # No sensors triggered - we're between sensors
-            self._in_full_zone = False
-            self._full_zone_feed_time = 0.
-            # Cancel burst if we've left the empty zone
-            # (unless burst is active - let it finish)
-            if self._burst_until > 0. and eventtime < self._burst_until:
-                new_direction = FORWARD
-            else:
-                self._burst_delay_start = 0.
-                self._burst_until = 0.
-                self._burst_count = 0
-                if self.motor_direction == FORWARD and \
-                        self._smoothed_velocity(eventtime) > self.min_velocity:
-                    new_direction = FORWARD
-                    vactual_override = self._velocity_to_vactual(
-                        self._smoothed_velocity(eventtime)
-                        * self.correction_factor)
-                elif self.motor_direction == BACK:
-                    # Continue retracting until we hit middle
-                    new_direction = BACK
-                elif self._smoothed_velocity(eventtime) > self.min_velocity:
-                    # Default: match extruder velocity
-                    new_direction = FORWARD
-                    vactual_override = self._velocity_to_vactual(
-                        self._smoothed_velocity(eventtime)
-                        * self.velocity_factor)
-                else:
-                    new_direction = STOP
+            zone = ZONE_NONE
+
+        # Track transitions — only update _prev_zone on actual change
+        entered = (zone != self._current_zone)
+        if entered:
+            self._prev_zone = self._current_zone
+        self._current_zone = zone
+
+        if zone == ZONE_EMPTY:
+            new_direction, vactual_override = self._zone_empty(
+                eventtime, entered)
+        elif zone == ZONE_FULL:
+            new_direction, vactual_override = self._zone_full_only(
+                eventtime, entered)
+        elif zone == ZONE_FULL_MIDDLE:
+            new_direction, vactual_override = self._zone_full_middle(
+                eventtime, entered)
+        elif zone == ZONE_MIDDLE:
+            new_direction, vactual_override = self._zone_middle(
+                eventtime, entered)
+        else:
+            new_direction, vactual_override = self._zone_no_sensors(
+                eventtime, entered)
+
+        # None = error handled internally by zone method
+        if new_direction is None:
+            return
 
         # Apply motor command
         if new_direction != self.motor_direction:
@@ -848,7 +918,9 @@ class Buffer:
             'forward_elapsed': round(self.forward_elapsed, 1),
             'forward_timeout': self.forward_timeout,
             'speed_rpm': self.motor.speed_rpm,
-            'in_full_zone': self._in_full_zone,
+            'in_full_zone': self._current_zone == ZONE_FULL,
+            'current_zone': self._current_zone,
+            'prev_zone': self._prev_zone,
             'full_zone_feed_time': round(self._full_zone_feed_time, 1),
             'full_zone_timeout': self.full_zone_timeout,
             'full_zone_retract_length': self.full_zone_retract_length,
@@ -900,15 +972,8 @@ class Buffer:
         self.state = STATE_STOPPED
         self.error_msg = ''
         self.forward_elapsed = 0.
-        self._in_full_zone = False
-        self._full_zone_feed_time = 0.
-        self._last_full_feed_time = 0.
-        self._burst_delay_start = 0.
-        self._burst_until = 0.
-        self._burst_count = 0
         self._extruder_retracting = False
-        self._velocity_window = []
-        self._manual_feed_full_start = 0.
+        self._reset_control_state()
         # Reset timing state
         self._last_ext_time = self.reactor.monotonic()
         self._last_e_command_time = 0.
@@ -919,17 +984,14 @@ class Buffer:
         self.auto_enabled = False
         self._stop_motor()
         self.state = STATE_DISABLED
-        self._in_full_zone = False
-        self._full_zone_feed_time = 0.
-        self._last_full_feed_time = 0.
-        self._burst_delay_start = 0.
-        self._burst_until = 0.
-        self._burst_count = 0
-        self._velocity_window = []
-        self._manual_feed_full_start = 0.
+        self._reset_control_state()
         gcmd.respond_info("Buffer: automatic control disabled")
 
     def cmd_BUFFER_FEED(self, gcmd):
+        if self.state == STATE_ERROR:
+            gcmd.respond_info("Buffer: cannot feed while in error state. "
+                              "Run BUFFER_CLEAR_ERROR first.")
+            return
         speed = gcmd.get_float('SPEED', self.motor.speed_rpm, above=0.)
         vactual = self.motor._rpm_to_vactual(speed)
         self.motor.set_velocity(FORWARD, vactual)
@@ -939,6 +1001,10 @@ class Buffer:
         gcmd.respond_info("Buffer: feeding at %.0f RPM" % speed)
 
     def cmd_BUFFER_RETRACT(self, gcmd):
+        if self.state == STATE_ERROR:
+            gcmd.respond_info("Buffer: cannot retract while in error "
+                              "state. Run BUFFER_CLEAR_ERROR first.")
+            return
         speed = gcmd.get_float('SPEED', self.motor.speed_rpm, above=0.)
         vactual = self.motor._rpm_to_vactual(speed)
         self.motor.set_velocity(BACK, vactual)
@@ -966,14 +1032,7 @@ class Buffer:
                 else STATE_IDLE
             self.error_msg = ''
             self.forward_elapsed = 0.
-            self._in_full_zone = False
-            self._full_zone_feed_time = 0.
-            self._last_full_feed_time = 0.
-            self._burst_delay_start = 0.
-            self._burst_until = 0.
-            self._burst_count = 0
-            self._velocity_window = []
-            self._manual_feed_full_start = 0.
+            self._reset_control_state()
             gcmd.respond_info("Buffer: error cleared")
         else:
             gcmd.respond_info("Buffer: no error to clear")
